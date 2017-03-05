@@ -90,6 +90,8 @@ public:
 	uint32_t write(uint64_t sector, uint16_t nsectors);
 //	void print_ios(void);
 
+	void verify();
+
 	uint64_t total_ios(void) {
 		return ios.size();
 	}

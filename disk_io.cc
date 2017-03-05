@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <event.h>
 
 #include "disk_io.h"
 
@@ -96,27 +97,19 @@ disk::~disk()
 	if (this->fd > 0) {
 		close(this->fd);
 	}
+
+	if (this->qevfd >= 0) {
+		close(qevfd);
+	}
+
+	if (ioevfd < 0) {
+		close(ioevfd);
+	}
 }
 
 void disk::pattern_create(uint64_t sector, uint16_t nsectors, string &pattern)
 {
 	pattern = "<" + std::to_string(sect) + "," + std::to_string(nsec) + ">";
-}
-
-uint32_t disk::write(uint64_t sector, uint16_t nsectors)
-{
-	string pattern;
-	pattern_create(sector, nsectors, pattern);
-
-	auto iop = std::make_shared<IO>(sector, nsectors, pattern, 0);
-	auto buf = io.get_buffer(&size);
-
-#if 0
-	char *bp = buf.get();
-	write(fd, bp, size);
-#endif
-
-	write_done(sector, nsectors);
 }
 
 void disk::write_done(IOPtr *newiop)
@@ -199,6 +192,89 @@ void disk::write_done(IOPtr *newiop)
 	} while (1);
 }
 
+int disk::submit_writes(uint64_t nwrites) {
+	struct iocb cbs[nwrites];
+
+	uint64_t s;
+	uint64_t ns;
+	size_t   size;
+	for (auto i = 0; i < nwrites; i++) {
+		iogen.next_io(&s, &ns)
+		assert(ns >= 1);
+
+		string p;
+		pattern_create(s, ns, p);
+
+		auto iop = new IO(s, ns, p, 0);
+		auto cbp = &cbs[i];
+		io_prep_pwrite(cbp, fd, iop->get_buffer(), iop->size(), iop->offset());
+		io_set_eventfd(cbp, ioevfdv);
+		cbp->data = static_cast<void *> std::move(iop);
+	}
+
+	return io_submit(this->io_context(), nwrites, &cbs);
+}
+
+ssize_t io_result(struct io_event *ep) {
+	return (((ssize_t) ep->res2 << 32) | (ssize_t) ep->res);
+}
+
+void on_io_complete(evutil_socket_t fd, short what, void *arg) {
+	assert(arg != NULL);
+
+	auto d = static_cast<disk *> arg;
+	assert(d->get_io_eventfd() == fd && d->get_io_event() != NULL);
+
+	eventfd_t nevents;
+	int rc = eventfd_read(fd, &nevents);
+	if (rc < 0 || nevents == 0) {
+		event_base_loopbreak(d->get_event_base());
+		return;
+	}
+
+	struct io_event *eventsp = new struct io_event[nevents];
+	rc = io_getevents(d->get_aio_context(), nevents, nevents, eventsp, NULL);
+	assert(rc == nevents);
+	unique_ptr<struct io_event[]> eventsup(eventsp);
+
+	/* process IO completion */
+	auto fu = std::async(std::launch::deferred, 
+			[](disk *d, unique_ptr<struct io_event[]> eventsup, eventfd_t n) {
+		struct io_event *eventsp = *ueventsp;		
+		for (auto ep = eventsp; ep < eventsp + n; ep++) {
+			auto iop = static_cast<IO *> ep->data;
+			assert(iop->size() == io_result(ep));
+			iop->set_result(io_result(ep));
+
+			auto iosp = shared_ptr<IO> iop;
+			d->write_done(iosp);
+		}
+	}, d, std::move(eventsup), nevents);
+
+	/* submit new set of IOs */
+	auto rc = d->submit_writes(nevents);
+	assert(rc == 0);
+
+	fu.wait();
+}
+
+void disk::verify() {
+	this->eb = event_base_new();
+	assert(eb != NULL);
+
+	this->ioevfd = eventfd(0, EFD_NONBLOCK);
+	if (ioevfd < 0) {
+		return
+	}
+
+	this->ioev = event_new(eb, ioevfd, EV_READ, on_io_complete, this);
+	assert(ioev != NULL);
+
+	event_add(qev, NULL);
+	event_add(ioev, NULL);
+
+	event_base_dispatch(eb);
+}
 #if 0
 void disk::print_ios(void)
 {
