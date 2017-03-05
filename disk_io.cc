@@ -40,9 +40,13 @@ IO::IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start):
 	this->pattern_start = pattern_start;
 }
 
-std::shared_ptr<char> IO::get_buffer(size_t *sizep)
+size_t IO::size() {
+	return sector_to_byte(r.nsectors);
+}
+
+std::shared_ptr<char> IO::get_buffer()
 {
-	auto sz = sector_to_byte(r.nsectors);
+	auto sz = size();
 
 	char *bp = new char[sz];
 	if (bp == nullptr) {
@@ -52,8 +56,6 @@ std::shared_ptr<char> IO::get_buffer(size_t *sizep)
 
 	/* create shared pointer to return */
 	std::shared_ptr<char> rbp(bp, [] (char *p) { delete[] p; });
-
-	*sizep = sz;
 
 	/* fill pattern in the buffer */
 	auto len = pattern.length();
@@ -90,6 +92,9 @@ disk::disk(string path)
 	this->path    = path;
 	this->size    = sz;
 	this->sectors = bytes_to_sector(sz);
+	this->eb      = NULL;
+	this->ioevfd  = -1;
+	this->ioev    = NULL;
 }
 
 disk::~disk()
@@ -98,13 +103,22 @@ disk::~disk()
 		close(this->fd);
 	}
 
-	if (this->qevfd >= 0) {
-		close(qevfd);
+	if (this->ioev != NULL) {
+		event_free(this->ioev);
+		this->ioev = NULL;
 	}
 
-	if (ioevfd < 0) {
-		close(ioevfd);
+	if (this->eb != NULL) {
+		event_base_free(this->eb);
+		this->eb = NULL;
 	}
+
+	if (this->ioevfd < 0) {
+		close(this->ioevfd);
+		ioevfd = -1;
+	}
+
+	io_destroy(this->context);
 }
 
 void disk::pattern_create(uint64_t sector, uint16_t nsectors, string &pattern)
@@ -209,7 +223,7 @@ int disk::submit_writes(uint64_t nwrites) {
 		auto cbp = &cbs[i];
 		io_prep_pwrite(cbp, fd, iop->get_buffer(), iop->size(), iop->offset());
 		io_set_eventfd(cbp, ioevfdv);
-		cbp->data = static_cast<void *> std::move(iop);
+		cbp->data = static_cast<void *> iop;
 	}
 
 	return io_submit(this->io_context(), nwrites, &cbs);
@@ -223,10 +237,10 @@ void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 	assert(arg != NULL);
 
 	auto d = static_cast<disk *> arg;
-	assert(d->get_io_eventfd() == fd && d->get_io_event() != NULL);
+	assert(d->get_io_eventfd() == fd && d->get_io_event());
 
 	eventfd_t nevents;
-	int rc = eventfd_read(fd, &nevents);
+	int rc = eventfd_read(d->disk_fd(), &nevents);
 	if (rc < 0 || nevents == 0) {
 		event_base_loopbreak(d->get_event_base());
 		return;
@@ -244,7 +258,6 @@ void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 		for (auto ep = eventsp; ep < eventsp + n; ep++) {
 			auto iop = static_cast<IO *> ep->data;
 			assert(iop->size() == io_result(ep));
-			iop->set_result(io_result(ep));
 
 			auto iosp = shared_ptr<IO> iop;
 			d->write_done(iosp);
@@ -253,26 +266,40 @@ void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 
 	/* submit new set of IOs */
 	auto rc = d->submit_writes(nevents);
-	assert(rc == 0);
+	if (rc < 0) {
+		event_base_loopbreak(d->get_event_base());
+	}
 
 	fu.wait();
 }
 
-void disk::verify() {
+int disk::verify() {
 	this->eb = event_base_new();
-	assert(eb != NULL);
+	if (ths->eb == NULL) {
+		std::cerr << "libevent initialization failed.\n";
+		return -1;
+	}
 
 	this->ioevfd = eventfd(0, EFD_NONBLOCK);
 	if (ioevfd < 0) {
-		return
+		std::cerr << "eventfd: %s\n" << strerror(errno);
+		return -1;
 	}
 
 	this->ioev = event_new(eb, ioevfd, EV_READ, on_io_complete, this);
+	if (ioev == NULL) {
+		std::cerr << "event_new failed.\n";
+		return -1;
+	}
 	assert(ioev != NULL);
 
-	event_add(qev, NULL);
-	event_add(ioev, NULL);
+	auto rc = io_setup(io_depth * 2, &this->context);
+	if (rc < 0) {
+		std::cerr << "io_setup: %s\n" << strerror(errno);
+		return -1;
+	}
 
+	event_add(ioev, NULL);
 	event_base_dispatch(eb);
 }
 #if 0

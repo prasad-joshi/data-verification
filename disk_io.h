@@ -50,7 +50,8 @@ public:
 	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start);
 
 public:
-	std::shared_ptr<char> get_buffer(size_t *sizep);
+	std::shared_ptr<char> get_buffer();
+	size_t size();
 };
 typedef std::shared_ptr<IO> IOPtr;
 
@@ -79,15 +80,20 @@ private:
 	uint64_t     total_writes;
 
 private:
+	struct event_base *ebp;
+	int               ioevfd;
+	struct event      *ioevp;
+	aio_context_t     context;
+private:
 	set<IOPtr, IOCompare> ios;
 
-private:
-	//void write_done(uint64_t sector, uint16_t nsectors, uint32_t offset);
+protected:
+	void write_done(IOPtr *newiop);
 
 public:
 	disk(string path);
 	~disk();
-	uint32_t write(uint64_t sector, uint16_t nsectors);
+	int submit_write(uint64_t nwrites);
 //	void print_ios(void);
 
 	void verify();
@@ -99,6 +105,25 @@ public:
 		return sectors;
 	}
 
+	aio_context_t get_aio_context(void) {
+		return context;
+	}
+
+	int disk_fd(void) {
+		return fd;
+	}
+
+	int get_io_eventfd(void) {
+		return ioevfd;
+	}
+
+	struct event *get_io_event(void) {
+		return ioevp;
+	}
+
+	struct event_base *get_event_base(void) {
+		return ebp;
+	}
 };
 
 #endif
