@@ -9,6 +9,9 @@
 #include <atomic>
 #include <utility>
 
+#include <libaio.h>
+#include <event.h>
+
 #include "zipf.h"
 
 using std::string;
@@ -78,25 +81,27 @@ private:
 	uint64_t     sectors;
 	int          fd;
 	uint64_t     total_writes;
+	int32_t      iodepth;
 
 private:
 	struct event_base *ebp;
 	int               ioevfd;
 	struct event      *ioevp;
-	aio_context_t     context;
+	io_context_t     context;
 private:
 	set<IOPtr, IOCompare> ios;
 
 protected:
-	void write_done(IOPtr *newiop);
+	void write_done(IOPtr newiop);
+	void pattern_create(uint64_t sector, uint16_t nsectors, string &pattern);
 
 public:
 	disk(string path);
 	~disk();
-	int submit_write(uint64_t nwrites);
+	int submit_writes(uint64_t nwrites);
 //	void print_ios(void);
 
-	void verify();
+	int verify();
 
 	uint64_t total_ios(void) {
 		return ios.size();
@@ -105,7 +110,7 @@ public:
 		return sectors;
 	}
 
-	aio_context_t get_aio_context(void) {
+	io_context_t get_aio_context(void) {
 		return context;
 	}
 

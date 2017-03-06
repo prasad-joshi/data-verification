@@ -19,6 +19,8 @@
 #include <fcntl.h>
 #include <event.h>
 
+#include <libaio.h>
+
 #include "disk_io.h"
 
 using std::string;
@@ -50,7 +52,6 @@ std::shared_ptr<char> IO::get_buffer()
 
 	char *bp = new char[sz];
 	if (bp == nullptr) {
-		*sizep = 0;
 		return nullptr;
 	}
 
@@ -89,12 +90,13 @@ disk::disk(string path)
 		return;
 	}
 
+	this->iodepth = 32;
 	this->path    = path;
 	this->size    = sz;
 	this->sectors = bytes_to_sector(sz);
-	this->eb      = NULL;
+	this->ebp     = NULL;
 	this->ioevfd  = -1;
-	this->ioev    = NULL;
+	this->ioevp   = NULL;
 }
 
 disk::~disk()
@@ -103,14 +105,15 @@ disk::~disk()
 		close(this->fd);
 	}
 
-	if (this->ioev != NULL) {
-		event_free(this->ioev);
-		this->ioev = NULL;
+	if (this->ioevp != NULL) {
+		event_del(this->ioevp);
+		event_free(this->ioevp);
+		this->ioevp = NULL;
 	}
 
-	if (this->eb != NULL) {
-		event_base_free(this->eb);
-		this->eb = NULL;
+	if (this->ebp != NULL) {
+		event_base_free(this->ebp);
+		this->ebp = NULL;
 	}
 
 	if (this->ioevfd < 0) {
@@ -121,14 +124,14 @@ disk::~disk()
 	io_destroy(this->context);
 }
 
-void disk::pattern_create(uint64_t sector, uint16_t nsectors, string &pattern)
+void disk::pattern_create(uint64_t sect, uint16_t nsec, string &pattern)
 {
 	pattern = "<" + std::to_string(sect) + "," + std::to_string(nsec) + ">";
 }
 
-void disk::write_done(IOPtr *newiop)
+void disk::write_done(IOPtr newiop)
 {
-	range r(newiop->sector, newiop->nsectors);
+	range r(newiop->r.sector, newiop->r.nsectors);
 	auto nios = r.start_sector(); /* new IO start sector */
 	auto nioe = r.end_sector();   /* new IO end sector   */
 
@@ -145,8 +148,9 @@ void disk::write_done(IOPtr *newiop)
 		std::cout << "preset " << (*io)->r.sector << " " << (*io)->r.nsectors << std::endl;
 		*/
 
-		auto oios = (*io)->r.start_sector(); /* old IO start sector */
-		auto oioe = (*io)->r.end_sector();   /* old IO end sector   */
+		auto oios     = (*io)->r.start_sector(); /* old IO start sector */
+		auto oions    = (*io)->r.nsectors;       /* old IO nsectors */
+		auto oioe     = (*io)->r.end_sector();   /* old IO end sector   */
 		auto opattern = (*io)->pattern;
 		if (oios == nios && oioe == nioe) {
 			/* exact match - only update pattern */
@@ -183,22 +187,22 @@ void disk::write_done(IOPtr *newiop)
 					auto o1ns = nios - o1s;
 					auto o1b  = opattern;
 
-					assert(o1s + o1ns == sector);
+					assert(o1s + o1ns == nios);
 					auto iop = std::make_shared<IO>(o1s, o1ns, opattern, 0);
 					write_done(iop);
 				}
 
 				auto o2s  = nioe + 1;
-				auto d    = o2s - old_r.start_sector();
-				auto o2ns = old_r.nsectors - d;
+				auto d    = o2s - oios;
+				auto o2ns = oions - d;
 				auto o2b  = (*io)->buffer + (d * 512);
 				write_done(o2s, o2ns, o2b);
 			}
 		} else {
-			auto d = r.end_sector() - old_r.sector + 1;
+			auto d = r.end_sector() - oios + 1;
 			assert(d != 0);
-			auto ons = old_r.nsectors - d;
-			auto oss = old_r.sector + d;
+			auto ons = oions - d;
+			auto oss = oios + d;
 			assert(r.sector + r.nsectors == oss);
 			auto ob  = (*io)->buffer + (d * 512);
 			write_done(oss, ons, ob);
@@ -253,19 +257,19 @@ void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 
 	/* process IO completion */
 	auto fu = std::async(std::launch::deferred, 
-			[](disk *d, unique_ptr<struct io_event[]> eventsup, eventfd_t n) {
-		struct io_event *eventsp = *ueventsp;		
-		for (auto ep = eventsp; ep < eventsp + n; ep++) {
-			auto iop = static_cast<IO *> ep->data;
+			[d, eventsupCap = std::move(eventsup), nevents]() {
+		struct io_event *eventsp = *eventsupCap;		
+		for (auto ep = eventsp; ep < eventsp + nevents; ep++) {
+			auto iop = static_cast<IO *>(ep->data);
 			assert(iop->size() == io_result(ep));
 
-			auto iosp = shared_ptr<IO> iop;
+			IOPtr iosp(iop);
 			d->write_done(iosp);
 		}
-	}, d, std::move(eventsup), nevents);
+	});
 
 	/* submit new set of IOs */
-	auto rc = d->submit_writes(nevents);
+	rc = d->submit_writes(nevents);
 	if (rc < 0) {
 		event_base_loopbreak(d->get_event_base());
 	}
@@ -293,7 +297,7 @@ int disk::verify() {
 	}
 	assert(ioev != NULL);
 
-	auto rc = io_setup(io_depth * 2, &this->context);
+	auto rc = io_setup(iodepth * 2, &this->context);
 	if (rc < 0) {
 		std::cerr << "io_setup: %s\n" << strerror(errno);
 		return -1;
