@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <memory>
+#include <future>
 #include <set>
 #include <vector>
 #include <atomic>
@@ -18,12 +19,17 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <event.h>
-
+#include <sys/eventfd.h>
 #include <libaio.h>
 
 #include "disk_io.h"
 
 using std::string;
+using std::unique_ptr;
+using std::shared_ptr;
+using std::make_shared;
+using std::cout;
+using std::endl;
 
 static inline uint64_t sector_to_byte(uint32_t sector)
 {
@@ -40,14 +46,21 @@ IO::IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start):
 {
 	this->pattern       = pattern;
 	this->pattern_start = pattern_start;
+	this->buffer        = nullptr;
 }
 
 size_t IO::size() {
 	return sector_to_byte(r.nsectors);
 }
 
+uint64_t IO::offset() {
+	return sector_to_byte(r.sector);
+}
+
 std::shared_ptr<char> IO::get_buffer()
 {
+	assert(this->buffer == nullptr);
+
 	auto sz = size();
 
 	char *bp = new char[sz];
@@ -74,10 +87,12 @@ std::shared_ptr<char> IO::get_buffer()
 		bp++;
 	}
 
+	/* maintain buffer pointer */
+	this->buffer = rbp;
 	return rbp;
 }
 
-disk::disk(string path)
+disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes)
 {
 	fd = open(path.c_str(), O_RDWR | O_DIRECT);
 	if (fd < 0) {
@@ -97,6 +112,8 @@ disk::disk(string path)
 	this->ebp     = NULL;
 	this->ioevfd  = -1;
 	this->ioevp   = NULL;
+
+	iogen = make_shared<io_generator>(0, this->sectors, sizes);
 }
 
 disk::~disk()
@@ -131,6 +148,7 @@ void disk::pattern_create(uint64_t sect, uint16_t nsec, string &pattern)
 
 void disk::write_done(IOPtr newiop)
 {
+	assert(newiop->buffer == NULL);
 	range r(newiop->r.sector, newiop->r.nsectors);
 	auto nios = r.start_sector(); /* new IO start sector */
 	auto nioe = r.end_sector();   /* new IO end sector   */
@@ -175,11 +193,29 @@ void disk::write_done(IOPtr newiop)
 
 		if (oios <= nios) {
 			if (oioe <= nioe) {
+				/*
+				 * old IO sector < new IO sector and old IO end <= new IO end
+				 *
+				 * for example:
+				 * CASE1: OLD IO (16, 16) and NEW IO(24, 16)
+				 *                      16       31
+				 *               OLD IO |--------|
+				 *                           24        39
+				 *               NEW IO      |---------|
+				 *
+				 * CASE2: OLD IO (32, 32) and NEW IO (56, 8)
+				 *                      32               63
+				 *               OLD IO |----------------|
+				 *                                 56    63
+				 *               NEW IO            |-----|
+				 *
+				 * In both the case old io's end is modified and new io is inserted
+				 */
 				oioe     = nios - 1;
 				auto ons = oioe - oios + 1;
 				assert(ons != 0);
 
-				auto iop = std::make_shared<IO>(oios, ons, opattern, 0);
+				auto iop = make_shared<IO>(oios, ons, opattern, 0);
 				write_done(iop);
 			} else {
 				if (oios != nios) {
@@ -188,7 +224,7 @@ void disk::write_done(IOPtr newiop)
 					auto o1b  = opattern;
 
 					assert(o1s + o1ns == nios);
-					auto iop = std::make_shared<IO>(o1s, o1ns, opattern, 0);
+					auto iop = make_shared<IO>(o1s, o1ns, opattern, 0);
 					write_done(iop);
 				}
 
@@ -199,13 +235,21 @@ void disk::write_done(IOPtr newiop)
 				write_done(o2s, o2ns, o2b);
 			}
 		} else {
+			/*
+			 * old IO ==> sector 32, nsectors 16 i.e. sectors 32 to 47
+			 * new IO ==> sector 24, nsectors 16 i.e. sectors 24 to 39
+			 *
+			 * change old IO's start to 40 and nsectors to 8
+			 * old IO's pattern remains as it is, however pattern start may change
+			 */
 			auto d = r.end_sector() - oios + 1;
 			assert(d != 0);
-			auto ons = oions - d;
-			auto oss = oios + d;
-			assert(r.sector + r.nsectors == oss);
-			auto ob  = (*io)->buffer + (d * 512);
-			write_done(oss, ons, ob);
+			auto ns = oions - d; /* calculate nsectors */
+			auto ss = oios + d;  /* start sector number */
+			assert(r.sector + r.nsectors == ss);
+			int16_t ps = sector_to_byte(d) % opattern.size(); /* pattern start */
+			auto iop = make_shared<IO>(ss, ns, opattern, ps);
+			write_done(iop);
 		}
 	} while (1);
 }
@@ -217,7 +261,7 @@ int disk::submit_writes(uint64_t nwrites) {
 	uint64_t ns;
 	size_t   size;
 	for (auto i = 0; i < nwrites; i++) {
-		iogen.next_io(&s, &ns)
+		iogen->next_io(&s, &ns);
 		assert(ns >= 1);
 
 		string p;
@@ -225,22 +269,23 @@ int disk::submit_writes(uint64_t nwrites) {
 
 		auto iop = new IO(s, ns, p, 0);
 		auto cbp = &cbs[i];
-		io_prep_pwrite(cbp, fd, iop->get_buffer(), iop->size(), iop->offset());
-		io_set_eventfd(cbp, ioevfdv);
-		cbp->data = static_cast<void *> iop;
+		auto buf = iop->get_buffer();
+		io_prep_pwrite(cbp, fd, (void *) buf.get(), iop->size(), iop->offset());
+		io_set_eventfd(cbp, ioevfd);
+		cbp->data = static_cast<void *>(iop);
 	}
 
-	return io_submit(this->io_context(), nwrites, &cbs);
+	return io_submit(this->get_aio_context(), nwrites, (iocb **) cbs);
 }
 
-ssize_t io_result(struct io_event *ep) {
-	return (((ssize_t) ep->res2 << 32) | (ssize_t) ep->res);
+size_t io_result(struct io_event *ep) {
+	return ((ssize_t)(((uint64_t)ep->res2 << 32) | ep->res));
 }
 
 void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 	assert(arg != NULL);
 
-	auto d = static_cast<disk *> arg;
+	auto d = static_cast<disk *>(arg);
 	assert(d->get_io_eventfd() == fd && d->get_io_event());
 
 	eventfd_t nevents;
@@ -253,15 +298,17 @@ void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 	struct io_event *eventsp = new struct io_event[nevents];
 	rc = io_getevents(d->get_aio_context(), nevents, nevents, eventsp, NULL);
 	assert(rc == nevents);
-	unique_ptr<struct io_event[]> eventsup(eventsp);
+	unique_ptr<io_event[]> eventsup(eventsp);
 
 	/* process IO completion */
 	auto fu = std::async(std::launch::deferred, 
 			[d, eventsupCap = std::move(eventsup), nevents]() {
-		struct io_event *eventsp = *eventsupCap;		
+		struct io_event *eventsp = eventsupCap.get();
 		for (auto ep = eventsp; ep < eventsp + nevents; ep++) {
 			auto iop = static_cast<IO *>(ep->data);
 			assert(iop->size() == io_result(ep));
+			/* free buffer pointer - it is no longer required */
+			iop->buffer = nullptr;
 
 			IOPtr iosp(iop);
 			d->write_done(iosp);
@@ -278,8 +325,8 @@ void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 }
 
 int disk::verify() {
-	this->eb = event_base_new();
-	if (ths->eb == NULL) {
+	this->ebp = event_base_new();
+	if (this->ebp == NULL) {
 		std::cerr << "libevent initialization failed.\n";
 		return -1;
 	}
@@ -290,12 +337,12 @@ int disk::verify() {
 		return -1;
 	}
 
-	this->ioev = event_new(eb, ioevfd, EV_READ, on_io_complete, this);
-	if (ioev == NULL) {
+	this->ioevp = event_new(ebp, ioevfd, EV_READ, on_io_complete, this);
+	if (ioevp == NULL) {
 		std::cerr << "event_new failed.\n";
 		return -1;
 	}
-	assert(ioev != NULL);
+	assert(ioevp != NULL);
 
 	auto rc = io_setup(iodepth * 2, &this->context);
 	if (rc < 0) {
@@ -303,8 +350,8 @@ int disk::verify() {
 		return -1;
 	}
 
-	event_add(ioev, NULL);
-	event_base_dispatch(eb);
+	event_add(ioevp, NULL);
+	event_base_dispatch(ebp);
 }
 #if 0
 void disk::print_ios(void)

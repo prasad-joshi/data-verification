@@ -12,6 +12,7 @@
 #include <libaio.h>
 #include <event.h>
 
+#include "io_generator.h"
 #include "zipf.h"
 
 using std::string;
@@ -50,11 +51,13 @@ public:
 	range   r;
 	string  pattern;
 	int16_t pattern_start;
+	shared_ptr<char> buffer;
 	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start);
 
 public:
 	std::shared_ptr<char> get_buffer();
 	size_t size();
+	uint64_t offset();
 };
 typedef std::shared_ptr<IO> IOPtr;
 
@@ -82,6 +85,7 @@ private:
 	int          fd;
 	uint64_t     total_writes;
 	int32_t      iodepth;
+	shared_ptr<io_generator> iogen;
 
 private:
 	struct event_base *ebp;
@@ -92,13 +96,13 @@ private:
 	set<IOPtr, IOCompare> ios;
 
 protected:
-	void write_done(IOPtr newiop);
 	void pattern_create(uint64_t sector, uint16_t nsectors, string &pattern);
 
 public:
-	disk(string path);
+	disk(string path, vector<pair<uint32_t, uint8_t>> sizes);
 	~disk();
 	int submit_writes(uint64_t nwrites);
+	void write_done(IOPtr newiop);
 //	void print_ios(void);
 
 	int verify();
