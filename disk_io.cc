@@ -57,7 +57,7 @@ uint64_t IO::offset() {
 	return sector_to_byte(r.sector);
 }
 
-std::shared_ptr<char> IO::get_buffer()
+std::shared_ptr<char> IO::prepare_io_buffer()
 {
 	assert(this->buffer == nullptr);
 
@@ -105,7 +105,7 @@ disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes)
 		return;
 	}
 
-	this->iodepth = 32;
+	this->iodepth = 2;
 	this->path    = path;
 	this->size    = sz;
 	this->sectors = bytes_to_sector(sz);
@@ -148,17 +148,24 @@ void disk::pattern_create(uint64_t sect, uint16_t nsec, string &pattern)
 
 void disk::write_done(IOPtr newiop)
 {
-	assert(newiop->buffer == NULL);
-	range r(newiop->r.sector, newiop->r.nsectors);
+	assert(newiop);
+	range r(newiop->r);
+	write_done(r.sector, r.nsectors, newiop->pattern, newiop->pattern_start);
+}
+
+void disk::write_done(uint64_t sector, uint16_t nsectors, string pattern, int16_t pattern_start) {
+	range r(sector, nsectors);
 	auto nios = r.start_sector(); /* new IO start sector */
 	auto nioe = r.end_sector();   /* new IO end sector   */
 
 	do {
 		auto io = ios.find(r);
 		if (io == ios.end()) {
+			auto newiop = make_shared<IO>(sector, nsectors, pattern, pattern_start);
 			ios.insert(newiop);
 			break;
 		}
+		//assert(!io->get_buffer());
 
 		/* overlapping IO range found */
 		/*
@@ -172,7 +179,7 @@ void disk::write_done(IOPtr newiop)
 		auto opattern = (*io)->pattern;
 		if (oios == nios && oioe == nioe) {
 			/* exact match - only update pattern */
-			(*io)->pattern       = newiop->pattern;
+			(*io)->pattern       = pattern;
 			(*io)->pattern_start = 0;
 			break;
 		}
@@ -215,8 +222,7 @@ void disk::write_done(IOPtr newiop)
 				auto ons = oioe - oios + 1;
 				assert(ons != 0);
 
-				auto iop = make_shared<IO>(oios, ons, opattern, 0);
-				write_done(iop);
+				write_done(oios, ons, opattern, 0);
 			} else {
 				if (oios != nios) {
 					auto o1s  = oios;
@@ -224,15 +230,14 @@ void disk::write_done(IOPtr newiop)
 					auto o1b  = opattern;
 
 					assert(o1s + o1ns == nios);
-					auto iop = make_shared<IO>(o1s, o1ns, opattern, 0);
-					write_done(iop);
+					write_done(o1s, o1ns, opattern, 0);
 				}
 
-				auto o2s  = nioe + 1;
-				auto d    = o2s - oios;
-				auto o2ns = oions - d;
-				auto o2b  = (*io)->buffer + (d * 512);
-				write_done(o2s, o2ns, o2b);
+				auto o2s   = nioe + 1;
+				auto d     = o2s - oios;
+				auto o2ns  = oions - d;
+				int16_t ps = sector_to_byte(d) % opattern.size();
+				write_done(o2s, o2ns, opattern, ps);
 			}
 		} else {
 			/*
@@ -248,13 +253,13 @@ void disk::write_done(IOPtr newiop)
 			auto ss = oios + d;  /* start sector number */
 			assert(r.sector + r.nsectors == ss);
 			int16_t ps = sector_to_byte(d) % opattern.size(); /* pattern start */
-			auto iop = make_shared<IO>(ss, ns, opattern, ps);
-			write_done(iop);
+			write_done(ss, ns, opattern, ps);
 		}
 	} while (1);
 }
 
 int disk::submit_writes(uint64_t nwrites) {
+	struct iocb *ios[nwrites];
 	struct iocb cbs[nwrites];
 
 	uint64_t s;
@@ -269,13 +274,20 @@ int disk::submit_writes(uint64_t nwrites) {
 
 		auto iop = new IO(s, ns, p, 0);
 		auto cbp = &cbs[i];
-		auto buf = iop->get_buffer();
+		auto buf = iop->prepare_io_buffer();
 		io_prep_pwrite(cbp, fd, (void *) buf.get(), iop->size(), iop->offset());
 		io_set_eventfd(cbp, ioevfd);
 		cbp->data = static_cast<void *>(iop);
+		ios[i]    = cbp;
 	}
 
-	return io_submit(this->get_aio_context(), nwrites, (iocb **) cbs);
+	auto rc = io_submit(context, nwrites, ios);
+	assert(rc == nwrites);
+	if (rc < 0) {
+		std::cerr << "io_submit: " << strerror(-rc) << endl;
+		return rc;
+	}
+	return 0;
 }
 
 size_t io_result(struct io_event *ep) {
@@ -289,8 +301,9 @@ void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 	assert(d->get_io_eventfd() == fd && d->get_io_event());
 
 	eventfd_t nevents;
-	int rc = eventfd_read(d->disk_fd(), &nevents);
+	int rc = eventfd_read(d->get_io_eventfd(), &nevents);
 	if (rc < 0 || nevents == 0) {
+		cout << "rc " << rc << " nevents " << nevents << endl;
 		event_base_loopbreak(d->get_event_base());
 		return;
 	}
@@ -344,14 +357,21 @@ int disk::verify() {
 	}
 	assert(ioevp != NULL);
 
+	std::memset(&this->context, 0, sizeof(this->context));
 	auto rc = io_setup(iodepth * 2, &this->context);
 	if (rc < 0) {
-		std::cerr << "io_setup: %s\n" << strerror(errno);
-		return -1;
+		std::cerr << "io_setup: " << strerror(-rc) << endl;
+		return rc;
 	}
 
 	event_add(ioevp, NULL);
-	event_base_dispatch(ebp);
+
+	rc = submit_writes(iodepth);
+	if (rc < 0) {
+		return rc;
+	}
+	rc = event_base_dispatch(ebp);
+	cout << "rc = " << rc << endl;
 }
 #if 0
 void disk::print_ios(void)

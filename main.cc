@@ -15,7 +15,7 @@ int main(int argc, char *argv[])
 	sizes.push_back(std::make_pair(8192>>9, 20));
 	sizes.push_back(std::make_pair(4096>>9, 10));
 
-	string path("/dev/sdb");
+	string path("/dev/loop0");
 	disk   sdb(path, sizes);
 	sdb.verify();
 	return 0;

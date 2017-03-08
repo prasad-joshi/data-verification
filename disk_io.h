@@ -30,6 +30,16 @@ public:
 		nsectors = nsect;
 	}
 
+	range(const range &r) {
+		this->sector   = r.sector;
+		this->nsectors = r.nsectors;
+	}
+
+	void operator = (const range &r) {
+		this->sector   = r.sector;
+		this->nsectors = r.nsectors;
+	}
+
 	range(): range(0, 0) {}
 
 	uint64_t end_sector(void) const {
@@ -55,7 +65,10 @@ public:
 	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start);
 
 public:
-	std::shared_ptr<char> get_buffer();
+	shared_ptr<char> prepare_io_buffer();
+	shared_ptr<char> get_buffer() {
+		return buffer;
+	}
 	size_t size();
 	uint64_t offset();
 };
@@ -97,6 +110,7 @@ private:
 
 protected:
 	void pattern_create(uint64_t sector, uint16_t nsectors, string &pattern);
+	void write_done(uint64_t s, uint16_t ns, string pattern, int16_t pattern_start);
 
 public:
 	disk(string path, vector<pair<uint32_t, uint8_t>> sizes);
