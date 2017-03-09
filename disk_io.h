@@ -8,6 +8,7 @@
 #include <vector>
 #include <atomic>
 #include <utility>
+#include <mutex>
 
 #include <libaio.h>
 #include <event.h>
@@ -61,12 +62,12 @@ public:
 	range   r;
 	string  pattern;
 	int16_t pattern_start;
-	shared_ptr<char> buffer;
+	char    *buffer;
 	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start);
 
 public:
-	shared_ptr<char> prepare_io_buffer();
-	shared_ptr<char> get_buffer() {
+	char *prepare_io_buffer();
+	char *get_buffer() {
 		return buffer;
 	}
 	size_t size();
@@ -106,6 +107,7 @@ private:
 	struct event      *ioevp;
 	io_context_t     context;
 private:
+	std::mutex            lock;
 	set<IOPtr, IOCompare> ios;
 
 protected:
@@ -116,7 +118,7 @@ public:
 	disk(string path, vector<pair<uint32_t, uint8_t>> sizes);
 	~disk();
 	int submit_writes(uint64_t nwrites);
-	void write_done(IOPtr newiop);
+	void write_done(vector<IOPtr> newiosp);
 //	void print_ios(void);
 
 	int verify();

@@ -102,7 +102,7 @@ public:
 		}
 
 		auto s = sector_rand.next();
-		assert(s >= 1 && s <= this->nsectors);
+		assert(s >= 0 && s <= this->nsectors);
 		s += this->sector;
 		assert(s < this->sector + this->nsectors);
 

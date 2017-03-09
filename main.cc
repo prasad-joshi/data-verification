@@ -12,8 +12,10 @@ using std::string;
 int main(int argc, char *argv[])
 {
 	vector<pair<uint32_t, uint8_t>> sizes;
-	sizes.push_back(std::make_pair(8192>>9, 20));
-	sizes.push_back(std::make_pair(4096>>9, 10));
+	sizes.push_back(std::make_pair((32*1024)>>9, 4));
+	sizes.push_back(std::make_pair((16*1024)>>9, 5));
+	sizes.push_back(std::make_pair(8192>>9, 50));
+	sizes.push_back(std::make_pair(4096>>9, 40));
 
 	string path("/dev/loop0");
 	disk   sdb(path, sizes);
