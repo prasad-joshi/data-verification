@@ -22,6 +22,8 @@ using std::vector;
 using std::shared_ptr;
 using std::pair;
 
+typedef shared_ptr<char> ManagedBuffer;
+
 class range {
 public:
 	uint64_t sector;
@@ -62,16 +64,13 @@ public:
 	range   r;
 	string  pattern;
 	int16_t pattern_start;
-	char    *buffer;
-	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start);
+	ManagedBuffer buffer;
 
 public:
-	char *prepare_io_buffer();
-	char *get_buffer() {
-		return buffer;
-	}
-	size_t size();
-	uint64_t offset();
+	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start);
+	ManagedBuffer get_io_buffer();
+	size_t        size();
+	uint64_t      offset();
 };
 typedef std::shared_ptr<IO> IOPtr;
 
