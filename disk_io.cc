@@ -22,6 +22,10 @@
 #include <sys/eventfd.h>
 #include <libaio.h>
 
+#include <folly/io/async/EventBase.h>
+#include <folly/io/async/EventHandler.h>
+#include <folly/io/async/AsyncTimeout.h>
+
 #include "disk_io.h"
 
 using std::string;
@@ -31,6 +35,8 @@ using std::make_shared;
 using std::cout;
 using std::endl;
 using std::runtime_error;
+
+using namespace folly;
 
 static inline uint64_t sector_to_byte(uint32_t sector)
 {
@@ -42,12 +48,13 @@ static inline uint32_t bytes_to_sector(uint64_t bytes)
 	return bytes >> 9;
 }
 
-IO::IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start):
+IO::IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start, IOType type):
 	r(sect, nsec)
 {
 	this->pattern       = pattern;
 	this->pattern_start = pattern_start;
 	this->buffer        = {};
+	this->type          = type;
 }
 
 size_t IO::size() {
@@ -122,9 +129,7 @@ disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes)
 	this->path    = path;
 	this->size    = sz;
 	this->sectors = bytes_to_sector(sz);
-	this->ebp     = {};
 	this->ioevfd  = -1;
-	this->ioevp   = {};
 
 	iogen = make_shared<io_generator>(0, this->sectors, sizes);
 }
@@ -133,19 +138,6 @@ disk::~disk()
 {
 	if (this->fd > 0) {
 		close(this->fd);
-	}
-
-	if (this->ioevp != NULL) {
-		cout << "Removing event.\n";
-		event_del(this->ioevp);
-		event_free(this->ioevp);
-		this->ioevp = {};
-	}
-
-	if (this->ebp != NULL) {
-		cout << "freeing event base.\n";
-		event_base_free(this->ebp);
-		this->ebp = {};
 	}
 
 	if (this->ioevfd < 0) {
@@ -161,13 +153,20 @@ void disk::pattern_create(uint64_t sect, uint16_t nsec, string &pattern)
 	pattern = "<" + std::to_string(sect) + "," + std::to_string(nsec) + ">";
 }
 
-void disk::write_done(vector<IOPtr> newiosp)
+void disk::io_done(vector<IOPtr> newiosp)
 {
 	std::lock_guard<std::mutex> l(this->lock);
 	for (auto &newiop : newiosp) {
 		assert(newiop->buffer);
-		range r(newiop->r);
-		write_done(r.sector, r.nsectors, newiop->pattern, newiop->pattern_start);
+		switch (newiop->type) {
+		case IOType::WRITE:
+			range r(newiop->r);
+			write_done(r.sector, r.nsectors, newiop->pattern, newiop->pattern_start);
+			break;
+		case IOType::READ:
+			read_done(newiop);
+			break;
+		}
 	}
 }
 
@@ -290,7 +289,7 @@ int disk::submit_writes(uint64_t nwrites) {
 		string p;
 		pattern_create(s, ns, p);
 
-		auto iop = new IO(s, ns, p, 0);
+		auto iop = new IO(s, ns, p, 0, IOType::WRITE);
 		auto cbp = &cbs[i];
 		auto buf = iop->get_io_buffer();
 		io_prep_pwrite(cbp, fd, buf.get(), iop->size(), iop->offset());
@@ -307,24 +306,37 @@ int disk::submit_writes(uint64_t nwrites) {
 	return 0;
 }
 
+int disk::submit_ios(uint64_t nios) {
+	int rc;
+
+	switch (mode) {
+	case IOMode::WRITE:
+		rc = submit_writes(nios);
+		break;
+	case IOMode::VERIFY:
+		rc = submit_reads(nios);
+		break;
+	}
+	return rc;
+}
+
 ssize_t io_result(struct io_event *ep) {
 	return ((ssize_t)(((uint64_t)ep->res2 << 32) | ep->res));
 }
 
-void on_io_complete(evutil_socket_t fd, short what, void *arg) {
+void on_io_complete(evutil_socket_t fd, void *arg) {
 	assert(arg != NULL);
 
 	auto d = static_cast<disk *>(arg);
-	assert(d->get_io_eventfd() == fd && d->get_io_event());
+	assert(d->get_io_eventfd() == fd);
 
 	eventfd_t nevents;
 	while (1) {
 		nevents = 0;
-		int rc = eventfd_read(d->get_io_eventfd(), &nevents);
+		int rc = eventfd_read(fd, &nevents);
 		if (rc < 0 || nevents == 0) {
 			if (rc < 0 && errno != EAGAIN) {
 				cout << "rc " << rc << " nevents " << nevents << endl;
-				event_base_loopbreak(d->get_event_base());
 			}
 			break;
 		}
@@ -344,37 +356,71 @@ void on_io_complete(evutil_socket_t fd, short what, void *arg) {
 				IOPtr iosp(iop);
 				iossp.emplace_back(iosp);
 			}
-			d->write_done(iossp);
+			d->io_done(iossp);
 		});
 
 		/* submit new set of IOs */
-		rc = d->submit_writes(nevents);
+		rc = d->submit_ios(nevents);
 		if (rc < 0) {
 			cout << "submit_writes failed.\n";
-			event_base_loopbreak(d->get_event_base());
 		}
 
 		fu.wait();
 	}
 }
 
-int disk::verify() {
-	this->ebp = event_base_new();
-	if (this->ebp == NULL) {
-		throw runtime_error("libevent initialization failed.");
+class EventFDHandler : public EventHandler {
+private:
+	disk      *diskp_;
+	int       fd_;
+	EventBase *basep_;
+public:
+	EventFDHandler(disk *diskp, int fd, EventBase *basep) :
+			EventHandler(basep, fd), diskp_(diskp), fd_(fd), basep_(basep) {
+		assert(diskp && eventfd >= 0 && basep);
 	}
 
+	void handlerReady(uint16_t events) noexcept {
+		assert(events & EventHandler::READ);
+		if (events & EventHandler::READ) {
+			on_io_complete(fd_, diskp_);
+		}
+	}
+};
+
+void disk::set_io_mode(IOMode mode) {
+	this->mode_   = mode;
+	this->timeout = std::make_unique<TimeoutWrapper>(this, &base);
+	this->timeout->scheduleTimeout(MIN_TO_MILLI(1));
+}
+
+void disk::switch_io_mode() {
+	IOMode m;
+	switch (this->mode_) {
+	case IOMode::WRITE:
+		m = IOMode::VERIFY;
+		cout << "Setting IO Mode to VERIFY\n";
+		break;
+	case IOMode::VERIFY:
+		m = IOMode::WRITE;
+		cout << "Setting IO Mode to WRITE\n";
+		break;
+	}
+
+	base.runInEventBaseThread([dpCap = this, mode = m] () {
+		dpCap->set_io_mode(mode);
+	});
+}
+
+int disk::verify() {
 	this->ioevfd = eventfd(0, EFD_NONBLOCK);
 	if (ioevfd < 0) {
 		throw runtime_error("eventfd creation failed " +
 				string(strerror(errno)));
 	}
 
-	this->ioevp = event_new(ebp, ioevfd, EV_READ|EV_PERSIST, on_io_complete, this);
-	if (ioevp == NULL) {
-		throw runtime_error("creating libevent failed.");
-	}
-	assert(ioevp != NULL);
+	EventFDHandler handler(this, ioevfd, &base);
+	handler.registerHandler(EventHandler::READ | EventHandler::PERSIST);
 
 	std::memset(&this->context, 0, sizeof(this->context));
 	auto rc = io_setup(iodepth * 2, &this->context);
@@ -382,12 +428,12 @@ int disk::verify() {
 		throw runtime_error("io_setup failed " + string(strerror(-rc)));
 	}
 
-	event_add(ioevp, NULL);
-
+	set_io_mode(IOMode::WRITE);
 	rc = submit_writes(iodepth);
 	assert(rc == 0);
 
-	rc = event_base_dispatch(ebp);
+	base.loopForever();
+	// rc = event_base_dispatch(ebp);
 	cout << "rc = " << rc << endl;
 }
 #if 0

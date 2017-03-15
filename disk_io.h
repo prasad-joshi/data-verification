@@ -13,16 +13,36 @@
 #include <libaio.h>
 #include <event.h>
 
+#include <folly/init/Init.h>
+#include <folly/io/async/EventBase.h>
+#include <folly/io/async/AsyncTimeout.h>
+
 #include "io_generator.h"
 #include "zipf.h"
+
+#define MIN_TO_SEC(min)   ((min) * 60)
+#define SEC_TO_MILL(sec)  ((sec) * 1000)
+#define MIN_TO_MILLI(min) (SEC_TO_MILL(MIN_TO_SEC((min))))
 
 using std::string;
 using std::set;
 using std::vector;
 using std::shared_ptr;
 using std::pair;
+using std::unique_ptr;
+using namespace folly;
 
 typedef shared_ptr<char> ManagedBuffer;
+
+enum IOMode {
+	WRITE,
+	VERIFY,
+};
+
+enum IOType {
+	WRITE,
+	READ,
+};
 
 class range {
 public:
@@ -65,9 +85,11 @@ public:
 	string  pattern;
 	int16_t pattern_start;
 	ManagedBuffer buffer;
+	IOType        type;
 
 public:
-	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start);
+	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start,
+			IOType type);
 	ManagedBuffer get_io_buffer();
 	size_t        size();
 	uint64_t      offset();
@@ -101,11 +123,10 @@ private:
 	shared_ptr<io_generator> iogen;
 
 private:
-	struct event_base *ebp;
-	int               ioevfd;
-	struct event      *ioevp;
+	folly::EventBase base;
+	int              ioevfd;
 	io_context_t     context;
-private:
+
 	std::mutex            lock;
 	set<IOPtr, IOCompare> ios;
 
@@ -114,10 +135,26 @@ protected:
 	void write_done(uint64_t s, uint16_t ns, string pattern, int16_t pattern_start);
 
 public:
+	class TimeoutWrapper : public AsyncTimeout {
+	private:
+		TimeoutManager *mp_;
+		disk           *dp_;
+	public:
+		TimeoutWrapper(disk *dp, TimeoutManager *mp) :
+				dp_(dp), mp_(mp), AsyncTimeout(mp) {
+		}
+
+		void timeoutExpired() noexcept {
+			dp_->switch_io_mode();
+		}
+	};
+
 	disk(string path, vector<pair<uint32_t, uint8_t>> sizes);
 	~disk();
 	int submit_writes(uint64_t nwrites);
 	void write_done(vector<IOPtr> newiosp);
+	void set_io_mode(IOMode mode);
+	void switch_io_mode();
 //	void print_ios(void);
 
 	int verify();
@@ -141,13 +178,9 @@ public:
 		return ioevfd;
 	}
 
-	struct event *get_io_event(void) {
-		return ioevp;
-	}
-
-	struct event_base *get_event_base(void) {
-		return ebp;
-	}
+private:
+	IOMode mode_;
+	unique_ptr<TimeoutWrapper> timeout;
 };
 
 #endif
