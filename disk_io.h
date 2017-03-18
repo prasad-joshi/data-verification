@@ -19,6 +19,7 @@
 
 #include "io_generator.h"
 #include "zipf.h"
+#include "AsyncIO.h"
 
 #define MIN_TO_SEC(min)   ((min) * 60)
 #define SEC_TO_MILL(sec)  ((sec) * 1000)
@@ -32,16 +33,9 @@ using std::pair;
 using std::unique_ptr;
 using namespace folly;
 
-typedef shared_ptr<char> ManagedBuffer;
-
-enum IOMode {
+enum class IOMode {
 	WRITE,
 	VERIFY,
-};
-
-enum IOType {
-	WRITE,
-	READ,
 };
 
 class range {
@@ -84,15 +78,11 @@ public:
 	range   r;
 	string  pattern;
 	int16_t pattern_start;
-	ManagedBuffer buffer;
-	IOType        type;
 
 public:
-	IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start,
-			IOType type);
-	ManagedBuffer get_io_buffer();
-	size_t        size();
-	uint64_t      offset();
+	IO(uint64_t sect, uint32_t nsec, const string &pattern, int16_t pattern_start);
+	size_t   size();
+	uint64_t offset();
 };
 typedef std::shared_ptr<IO> IOPtr;
 
@@ -119,20 +109,22 @@ private:
 	uint64_t     sectors;
 	int          fd;
 	uint64_t     total_writes;
-	int32_t      iodepth;
-	shared_ptr<io_generator> iogen;
+	uint16_t     iodepth;
+	unique_ptr<io_generator> iogen;
 
 private:
-	folly::EventBase base;
-	int              ioevfd;
-	io_context_t     context;
-
+	folly::EventBase      base;
+	AsyncIO               asyncio;
 	std::mutex            lock;
 	set<IOPtr, IOCompare> ios;
 
 protected:
-	void pattern_create(uint64_t sector, uint16_t nsectors, string &pattern);
-	void write_done(uint64_t s, uint16_t ns, string pattern, int16_t pattern_start);
+	void setIOMode(IOMode mode);
+	int  writesSubmit(uint64_t nreads);
+	int  readsSubmit(uint64_t nreads);
+
+	ManagedBuffer getIOBuffer(size_t size);
+	ManagedBuffer prepareIOBuffer(size_t size, const string &pattern);
 
 public:
 	class TimeoutWrapper : public AsyncTimeout {
@@ -145,19 +137,20 @@ public:
 		}
 
 		void timeoutExpired() noexcept {
-			dp_->switch_io_mode();
+			dp_->switchIOMode();
 		}
 	};
 
-	disk(string path, vector<pair<uint32_t, uint8_t>> sizes);
+	disk(string path, vector<pair<uint32_t, uint8_t>> sizes, uint16_t qdepth);
 	~disk();
-	int submit_writes(uint64_t nwrites);
-	void write_done(vector<IOPtr> newiosp);
-	void set_io_mode(IOMode mode);
-	void switch_io_mode();
-//	void print_ios(void);
+	void switchIOMode();
+	int  verify();
 
-	int verify();
+	void patternCreate(uint64_t sector, uint16_t nsectors, string &pattern);
+	void writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, const int16_t pattern_start);
+	void readDone(const char *const data, uint64_t sector, uint16_t nsectors, const string &pattern);
+	int  iosSubmit(uint64_t nios);
+//	void print_ios(void);
 
 	uint64_t total_ios(void) {
 		return ios.size();
@@ -166,16 +159,8 @@ public:
 		return sectors;
 	}
 
-	io_context_t get_aio_context(void) {
-		return context;
-	}
-
 	int disk_fd(void) {
 		return fd;
-	}
-
-	int get_io_eventfd(void) {
-		return ioevfd;
 	}
 
 private:

@@ -4,7 +4,7 @@ CPPCLAGS := -g -ggdb -O0
 
 all: main
 
-main: disk_io.cc main.cc
+main: disk_io.cc main.cc AsyncIO.cpp
 	g++ -std=c++14 $(CPPCLAGS) $(INC) -o $@ $^ $(LIBS)
 
 clean:

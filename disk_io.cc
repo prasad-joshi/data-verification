@@ -38,23 +38,18 @@ using std::runtime_error;
 
 using namespace folly;
 
-static inline uint64_t sector_to_byte(uint32_t sector)
-{
+static inline uint64_t sector_to_byte(uint32_t sector) {
 	return sector << 9;
 }
 
-static inline uint32_t bytes_to_sector(uint64_t bytes)
-{
+static inline uint32_t bytes_to_sector(uint64_t bytes) {
 	return bytes >> 9;
 }
 
-IO::IO(uint64_t sect, uint32_t nsec, string &pattern, int16_t pattern_start, IOType type):
-	r(sect, nsec)
-{
+IO::IO(uint64_t sect, uint32_t nsec, const string &pattern, int16_t pattern_start):
+			r(sect, nsec) {
 	this->pattern       = pattern;
 	this->pattern_start = pattern_start;
-	this->buffer        = {};
-	this->type          = type;
 }
 
 size_t IO::size() {
@@ -65,47 +60,7 @@ uint64_t IO::offset() {
 	return sector_to_byte(r.sector);
 }
 
-#define PAGE_SIZE 4096
-#define DEFAULT_ALIGNMENT PAGE_SIZE
-
-ManagedBuffer alignedAlloc(size_t sz) {
-	void *bufp{};
-	auto rc    = posix_memalign(&bufp, DEFAULT_ALIGNMENT,  sz);
-	assert(rc == 0 && bufp != NULL);
-	return ManagedBuffer(reinterpret_cast<char*>(bufp),
-			[] (void *p) { free(p); });
-}
-
-ManagedBuffer IO::get_io_buffer() {
-	assert(this->buffer == nullptr);
-
-	auto sz = size();
-
-	auto bufp = alignedAlloc(sz);
-	char *bp  = bufp.get();
-
-	/* fill pattern in the buffer */
-	auto len = pattern.length();
-	auto i   = sz / len;
-	while (i--) {
-		/* fast path */
-		std::memcpy(bp, static_cast<const void *>(pattern.c_str()), len);
-		bp += len;
-	}
-
-	i = sz - ((sz/len) * len);
-	for (auto j = 0; j < i; j++) {
-		/* slow char by char copy */
-		*bp = pattern.at(j);
-		bp++;
-	}
-
-	this->buffer = bufp;
-	return bufp;
-}
-
-disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes)
-{
+disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes, uint16_t qdepth) : asyncio(qdepth) {
 	fd = open(path.c_str(), O_RDWR | O_DIRECT);
 	if (fd < 0) {
 		throw runtime_error("Could not open file " + path);
@@ -125,52 +80,131 @@ disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes)
 	}
 	assert(sz != 0);
 
-	this->iodepth = 32;
+	this->iodepth = qdepth;
 	this->path    = path;
 	this->size    = sz;
 	this->sectors = bytes_to_sector(sz);
-	this->ioevfd  = -1;
-
-	iogen = make_shared<io_generator>(0, this->sectors, sizes);
+	this->iogen   = std::make_unique<io_generator>(0, this->sectors, sizes);
 }
 
-disk::~disk()
-{
+disk::~disk() {
 	if (this->fd > 0) {
 		close(this->fd);
 	}
-
-	if (this->ioevfd < 0) {
-		close(this->ioevfd);
-		ioevfd = -1;
-	}
-
-	io_destroy(this->context);
 }
 
-void disk::pattern_create(uint64_t sect, uint16_t nsec, string &pattern)
-{
+void disk::patternCreate(uint64_t sect, uint16_t nsec, string &pattern) {
 	pattern = "<" + std::to_string(sect) + "," + std::to_string(nsec) + ">";
 }
 
-void disk::io_done(vector<IOPtr> newiosp)
-{
-	std::lock_guard<std::mutex> l(this->lock);
-	for (auto &newiop : newiosp) {
-		assert(newiop->buffer);
-		switch (newiop->type) {
-		case IOType::WRITE:
-			range r(newiop->r);
-			write_done(r.sector, r.nsectors, newiop->pattern, newiop->pattern_start);
-			break;
-		case IOType::READ:
-			read_done(newiop);
-			break;
-		}
+ManagedBuffer disk::prepareIOBuffer(size_t size, const string &pattern) {
+	auto bufp = asyncio.getIOBuffer(size);
+	assert(bufp);
+
+	char *bp = bufp.get();
+
+	/* fill pattern in the buffer */
+	auto len = pattern.length();
+	auto i   = size / len;
+	while (i--) {
+		/* fast path */
+		std::memcpy(bp, static_cast<const void *>(pattern.c_str()), len);
+		bp += len;
 	}
+
+	i = size - ((size/len) * len);
+	for (auto j = 0; j < i; j++) {
+		/* slow char by char copy */
+		*bp = pattern.at(j);
+		bp++;
+	}
+
+	return std::move(bufp);
 }
 
-void disk::write_done(uint64_t sector, uint16_t nsectors, string pattern, int16_t pattern_start) {
+ManagedBuffer disk::getIOBuffer(size_t size) {
+	return asyncio.getIOBuffer(size);
+}
+
+int disk::writesSubmit(uint64_t nwrites) {
+	struct iocb *ios[nwrites];
+	struct iocb cbs[nwrites];
+	struct iocb *cbp;
+	uint64_t    s;
+	uint64_t    ns;
+	size_t      sz;
+	uint64_t    o;
+
+	for (auto i = 0; i < nwrites; i++) {
+		iogen->next_io(&s, &ns);
+		assert(ns >= 1 && s <= sectors && s+ns <= sectors);
+
+		string p;
+		patternCreate(s, ns, p);
+
+		sz        = sector_to_byte(ns);
+		o         = sector_to_byte(s);
+		auto bufp = prepareIOBuffer(sz, p);
+		cbp       = &cbs[i];
+		ios[i]    = cbp;
+		asyncio.pwritePrepare(cbp, fd, std::move(bufp), sz, o);
+	}
+
+	auto rc = asyncio.pwrite(ios, nwrites);
+	assert(rc == nwrites);
+	if (rc < 0) {
+		throw runtime_error("io_submit failed " + string(strerror(-rc)));
+	}
+	return 0;
+}
+
+int disk::readsSubmit(uint64_t nreads) {
+	struct iocb *ios[nreads];
+	struct iocb cbs[nreads];
+	struct iocb *cbp;
+	uint64_t    s;
+	uint64_t    ns;
+	size_t      sz;
+	uint64_t    o;
+	
+	for (auto i = 0; i < nreads; i++) {
+		iogen->next_io(&s, &ns);
+		assert(ns >= 1 && s <= sectors && s+ns <= sectors);
+
+		sz        = sector_to_byte(ns);
+		o         = sector_to_byte(s);
+		auto bufp = getIOBuffer(sz);
+		cbp       = &cbs[i];
+		ios[i]    = cbp;
+		asyncio.preadPrepare(cbp, fd, std::move(bufp), sz, o);
+	}
+
+	auto rc = asyncio.pread(ios, nreads);
+	assert(rc == nreads);
+	if (rc < 0) {
+		throw runtime_error("io_submit failed " + string(strerror(-rc)));
+	}
+	return 0;
+}
+
+int disk::iosSubmit(uint64_t nios) {
+	int rc;
+
+	switch (mode_) {
+	case IOMode::WRITE:
+		rc = writesSubmit(nios);
+		break;
+	case IOMode::VERIFY:
+		rc = readsSubmit(nios);
+		break;
+	}
+	return rc;
+}
+
+void disk::readDone(const char *const data, uint64_t sector, uint16_t nsectors, const string &pattern) {
+}
+
+void disk::writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, const int16_t pattern_start) {
 	range r(sector, nsectors);
 	auto nios = r.start_sector(); /* new IO start sector */
 	auto nioe = r.end_sector();   /* new IO end sector   */
@@ -182,7 +216,6 @@ void disk::write_done(uint64_t sector, uint16_t nsectors, string pattern, int16_
 			ios.insert(newiop);
 			break;
 		}
-		//assert(!io->get_buffer());
 
 		/* overlapping IO range found */
 		/*
@@ -239,7 +272,7 @@ void disk::write_done(uint64_t sector, uint16_t nsectors, string pattern, int16_
 				auto ons = oioe - oios + 1;
 				assert(ons != 0);
 
-				write_done(oios, ons, opattern, 0);
+				writeDone(oios, ons, opattern, 0);
 			} else {
 				if (oios != nios) {
 					auto o1s  = oios;
@@ -247,14 +280,14 @@ void disk::write_done(uint64_t sector, uint16_t nsectors, string pattern, int16_
 					auto o1b  = opattern;
 
 					assert(o1s + o1ns == nios);
-					write_done(o1s, o1ns, opattern, 0);
+					writeDone(o1s, o1ns, opattern, 0);
 				}
 
 				auto o2s   = nioe + 1;
 				auto d     = o2s - oios;
 				auto o2ns  = oions - d;
 				int16_t ps = sector_to_byte(d) % opattern.size();
-				write_done(o2s, o2ns, opattern, ps);
+				writeDone(o2s, o2ns, opattern, ps);
 			}
 		} else {
 			/*
@@ -270,131 +303,37 @@ void disk::write_done(uint64_t sector, uint16_t nsectors, string pattern, int16_
 			auto ss = oios + d;  /* start sector number */
 			assert(r.sector + r.nsectors == ss);
 			int16_t ps = sector_to_byte(d) % opattern.size(); /* pattern start */
-			write_done(ss, ns, opattern, ps);
+			writeDone(ss, ns, opattern, ps);
 		}
 	} while (1);
 }
 
-int disk::submit_writes(uint64_t nwrites) {
-	struct iocb *ios[nwrites];
-	struct iocb cbs[nwrites];
+void ioCompleted(void *cbdata, ManagedBuffer bufp, size_t size, uint64_t offset, ssize_t result, bool read) {
+	assert(cbdata && bufp && result == size);
 
-	uint64_t s;
-	uint64_t ns;
-	size_t   size;
-	for (auto i = 0; i < nwrites; i++) {
-		iogen->next_io(&s, &ns);
-		assert(ns >= 1 && s <= sectors && s+ns <= sectors);
+	disk     *diskp   = reinterpret_cast<disk *>(cbdata);
+	uint64_t sector   = bytes_to_sector(offset);
+	uint32_t nsectors = bytes_to_sector(size);
+	char     *bp      = bufp.get();
+	string   pattern;
 
-		string p;
-		pattern_create(s, ns, p);
-
-		auto iop = new IO(s, ns, p, 0, IOType::WRITE);
-		auto cbp = &cbs[i];
-		auto buf = iop->get_io_buffer();
-		io_prep_pwrite(cbp, fd, buf.get(), iop->size(), iop->offset());
-		io_set_eventfd(cbp, ioevfd);
-		cbp->data = static_cast<void *>(iop);
-		ios[i]    = cbp;
+	diskp->patternCreate(sector, nsectors, pattern);
+	if (read == true) {
+		diskp->readDone(bp, sector, nsectors, pattern);
+	} else {
+		diskp->writeDone(sector, nsectors, pattern, 0);
 	}
 
-	auto rc = io_submit(context, nwrites, ios);
-	assert(rc == nwrites);
-	if (rc < 0) {
-		throw runtime_error("io_submit failed " + string(strerror(-rc)));
-	}
-	return 0;
+	diskp->iosSubmit(1);
 }
 
-int disk::submit_ios(uint64_t nios) {
-	int rc;
-
-	switch (mode) {
-	case IOMode::WRITE:
-		rc = submit_writes(nios);
-		break;
-	case IOMode::VERIFY:
-		rc = submit_reads(nios);
-		break;
-	}
-	return rc;
-}
-
-ssize_t io_result(struct io_event *ep) {
-	return ((ssize_t)(((uint64_t)ep->res2 << 32) | ep->res));
-}
-
-void on_io_complete(evutil_socket_t fd, void *arg) {
-	assert(arg != NULL);
-
-	auto d = static_cast<disk *>(arg);
-	assert(d->get_io_eventfd() == fd);
-
-	eventfd_t nevents;
-	while (1) {
-		nevents = 0;
-		int rc = eventfd_read(fd, &nevents);
-		if (rc < 0 || nevents == 0) {
-			if (rc < 0 && errno != EAGAIN) {
-				cout << "rc " << rc << " nevents " << nevents << endl;
-			}
-			break;
-		}
-
-		struct io_event *eventsp = new struct io_event[nevents];
-		rc = io_getevents(d->get_aio_context(), nevents, nevents, eventsp, NULL);
-		assert(rc == nevents);
-		unique_ptr<io_event[]> eventsup(eventsp);
-
-		/* process IO completion */
-		auto fu = std::async([d, eventsupCap = std::move(eventsup), nevents]() mutable {
-			struct io_event *eventsp = eventsupCap.get();
-			vector<IOPtr> iossp;
-			for (auto ep = eventsp; ep < eventsp + nevents; ep++) {
-				auto iop = static_cast<IO *>(ep->data);
-				assert(iop->size() == io_result(ep));
-				IOPtr iosp(iop);
-				iossp.emplace_back(iosp);
-			}
-			d->io_done(iossp);
-		});
-
-		/* submit new set of IOs */
-		rc = d->submit_ios(nevents);
-		if (rc < 0) {
-			cout << "submit_writes failed.\n";
-		}
-
-		fu.wait();
-	}
-}
-
-class EventFDHandler : public EventHandler {
-private:
-	disk      *diskp_;
-	int       fd_;
-	EventBase *basep_;
-public:
-	EventFDHandler(disk *diskp, int fd, EventBase *basep) :
-			EventHandler(basep, fd), diskp_(diskp), fd_(fd), basep_(basep) {
-		assert(diskp && eventfd >= 0 && basep);
-	}
-
-	void handlerReady(uint16_t events) noexcept {
-		assert(events & EventHandler::READ);
-		if (events & EventHandler::READ) {
-			on_io_complete(fd_, diskp_);
-		}
-	}
-};
-
-void disk::set_io_mode(IOMode mode) {
+void disk::setIOMode(IOMode mode) {
 	this->mode_   = mode;
 	this->timeout = std::make_unique<TimeoutWrapper>(this, &base);
 	this->timeout->scheduleTimeout(MIN_TO_MILLI(1));
 }
 
-void disk::switch_io_mode() {
+void disk::switchIOMode() {
 	IOMode m;
 	switch (this->mode_) {
 	case IOMode::WRITE:
@@ -408,28 +347,16 @@ void disk::switch_io_mode() {
 	}
 
 	base.runInEventBaseThread([dpCap = this, mode = m] () {
-		dpCap->set_io_mode(mode);
+		dpCap->setIOMode(mode);
 	});
 }
 
 int disk::verify() {
-	this->ioevfd = eventfd(0, EFD_NONBLOCK);
-	if (ioevfd < 0) {
-		throw runtime_error("eventfd creation failed " +
-				string(strerror(errno)));
-	}
+	asyncio.init(&base);
+	asyncio.registerIOCompleteCB(ioCompleted, this);
 
-	EventFDHandler handler(this, ioevfd, &base);
-	handler.registerHandler(EventHandler::READ | EventHandler::PERSIST);
-
-	std::memset(&this->context, 0, sizeof(this->context));
-	auto rc = io_setup(iodepth * 2, &this->context);
-	if (rc < 0) {
-		throw runtime_error("io_setup failed " + string(strerror(-rc)));
-	}
-
-	set_io_mode(IOMode::WRITE);
-	rc = submit_writes(iodepth);
+	setIOMode(IOMode::WRITE);
+	auto rc = iosSubmit(iodepth);
 	assert(rc == 0);
 
 	base.loopForever();
