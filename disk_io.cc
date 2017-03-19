@@ -135,6 +135,8 @@ int disk::writesSubmit(uint64_t nwrites) {
 		iogen->next_io(&s, &ns);
 		assert(ns >= 1 && s <= sectors && s+ns <= sectors);
 
+		// cout << "W " << s << " " << ns << endl;
+
 		string p;
 		patternCreate(s, ns, p);
 
@@ -167,6 +169,7 @@ int disk::readsSubmit(uint64_t nreads) {
 		iogen->next_io(&s, &ns);
 		assert(ns >= 1 && s <= sectors && s+ns <= sectors);
 
+		// cout << "R " << s << " " << ns << endl;
 		sz        = sector_to_byte(ns);
 		o         = sector_to_byte(s);
 		auto bufp = getIOBuffer(sz);
@@ -994,6 +997,7 @@ void disk::testSectorReads() {
 
 	for (auto s = SECTOR; s < (SECTOR + NSECTORS); s += 2) {
 		testWriteSubmit(s, 1);
+		base.loopOnce();
 		_testSectorReads(SECTOR, NSECTORS);
 	}
 
