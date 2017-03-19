@@ -38,11 +38,11 @@ using std::runtime_error;
 
 using namespace folly;
 
-static inline uint64_t sector_to_byte(uint32_t sector) {
+static inline uint64_t sector_to_byte(uint64_t sector) {
 	return sector << 9;
 }
 
-static inline uint32_t bytes_to_sector(uint64_t bytes) {
+static inline uint64_t bytes_to_sector(uint64_t bytes) {
 	return bytes >> 9;
 }
 
