@@ -104,21 +104,17 @@ ManagedBuffer disk::prepareIOBuffer(size_t size, const string &pattern) {
 	char *bp = bufp.get();
 
 	/* fill pattern in the buffer */
+	const char *const p = pattern.c_str();
 	auto len = pattern.length();
 	auto i   = size / len;
+	assert(i > 0);
 	while (i--) {
-		/* fast path */
-		std::memcpy(bp, static_cast<const void *>(pattern.c_str()), len);
+		std::memcpy(bp, p, len);
 		bp += len;
 	}
 
 	i = size - ((size/len) * len);
-	for (auto j = 0; j < i; j++) {
-		/* slow char by char copy */
-		*bp = pattern.at(j);
-		bp++;
-	}
-
+	std::memcpy(bp, p, i);
 	return std::move(bufp);
 }
 
@@ -201,7 +197,110 @@ int disk::iosSubmit(uint64_t nios) {
 	return rc;
 }
 
-void disk::readDone(const char *const data, uint64_t sector, uint16_t nsectors, const string &pattern) {
+bool disk::patternCompare(const char *const bufp, size_t size, const string &pattern, int16_t start) {
+	assert(bufp && pattern.length() && pattern.length() >= start &&
+			size > pattern.length() && size >= 512 && pattern.length() < 512);
+
+	const char *const p = pattern.c_str();
+	const char *bp      = bufp;
+	auto len = pattern.length();
+	auto i   = size / len;
+	assert(i > 0);
+	while (i--) {
+		/* fast path */
+		auto cl = len - start;
+		auto rc = std::memcmp(bp, p + start, cl);
+		if (rc != 0) {
+			/* corruption */
+			assert(0);
+			return true;
+		}
+		bp    += cl;
+		start  = 0;
+	}
+
+	i = size - ((size/len) * len);
+	auto rc = std::memcmp(bp, p, i);
+	if (rc != 0) {
+		/* corruption */
+		return true;
+	}
+	return false;
+}
+
+bool disk::readDataVerify(const char *const data, uint64_t sector, uint16_t nsectors) {
+	range r(sector, nsectors);
+	auto  io = ios.find(r);
+	if (io == ios.end()) {
+		/* case 0: <sector, nsector> are never written before */
+		return false;
+	}
+
+	auto rios = r.start_sector();
+	auto rioe = r.end_sector();
+	auto oios = (*io)->r.start_sector();
+	auto oioe = (*io)->r.end_sector();
+
+	const char *vbufp = data;     /* verification buffer pointer */
+	auto       vssec  = sector;   /* verfification start sector  */
+	auto       vnsec  = nsectors; /* number of sectors to verify */
+	if (rios < oios) {
+		/*
+		 * CASE 1:
+		 *
+		 * Read IOs start sector is before found IOs start sector. Since this
+		 * part is not part of IOS set, it should never have data corruption.
+		 */
+		auto s  = rios;
+		auto ns = oios - s;
+		auto c  = readDataVerify(vbufp, s, ns);
+		if (c == true) {
+			/* corruption */
+			assert(0);
+		}
+		assert(vnsec > ns);
+
+		vbufp += sector_to_byte(ns);
+		vssec  = oios;
+		vnsec  = vnsec - ns;
+	}
+	assert(vnsec > 0);
+
+	/*
+	 * CASE 2:
+	 *
+	 */
+	auto s    = vssec;
+	auto vend = MIN(oioe, rioe);
+	auto ns   = vend - s + 1;
+	assert(ns <= vnsec);
+	auto d    = vssec - oios;
+	auto ps   = (sector_to_byte(d) + (*io)->pattern_start) % (*io)->pattern.length();
+	auto c    = patternCompare(vbufp, sector_to_byte(ns), (*io)->pattern, ps);
+	if (c == true) {
+		/* corruption */
+		cout << "Read IO (" << sector << ", " << nsectors << ") corruption at (" << s << "," << ns << ")" << endl;
+		assert(0);
+		return true;
+	} else if (vnsec <= ns) {
+		/* data has been verified - no corruption */
+		assert(vnsec - ns == 0);
+		return false;
+	}
+
+	/* CASE 3: */
+	vssec  = vend + 1;
+	vnsec -= ns;
+	vbufp += sector_to_byte(ns);
+
+	return readDataVerify(vbufp, vssec, vnsec);
+}
+
+void disk::readDone(const char *const bufp, uint64_t sector, uint16_t nsectors) {
+	auto corruption = readDataVerify(bufp, sector, nsectors);
+	if (corruption) {
+		assert(0);
+	}
 }
 
 void disk::writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, const int16_t pattern_start) {
@@ -227,6 +326,7 @@ void disk::writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, 
 		auto oions    = (*io)->r.nsectors;       /* old IO nsectors */
 		auto oioe     = (*io)->r.end_sector();   /* old IO end sector   */
 		auto opattern = (*io)->pattern;
+		auto ops      = (*io)->pattern_start;
 		if (oios == nios && oioe == nioe) {
 			/* exact match - only update pattern */
 			(*io)->pattern       = pattern;
@@ -272,7 +372,7 @@ void disk::writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, 
 				auto ons = oioe - oios + 1;
 				assert(ons != 0);
 
-				writeDone(oios, ons, opattern, 0);
+				writeDone(oios, ons, opattern, ops);
 			} else {
 				if (oios != nios) {
 					auto o1s  = oios;
@@ -280,13 +380,13 @@ void disk::writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, 
 					auto o1b  = opattern;
 
 					assert(o1s + o1ns == nios);
-					writeDone(o1s, o1ns, opattern, 0);
+					writeDone(o1s, o1ns, opattern, ops);
 				}
 
 				auto o2s   = nioe + 1;
 				auto d     = o2s - oios;
 				auto o2ns  = oions - d;
-				int16_t ps = sector_to_byte(d) % opattern.size();
+				int16_t ps = (sector_to_byte(d) + ops) % opattern.size();
 				writeDone(o2s, o2ns, opattern, ps);
 			}
 		} else {
@@ -302,35 +402,45 @@ void disk::writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, 
 			auto ns = oions - d; /* calculate nsectors */
 			auto ss = oios + d;  /* start sector number */
 			assert(r.sector + r.nsectors == ss);
-			int16_t ps = sector_to_byte(d) % opattern.size(); /* pattern start */
+			int16_t ps = (sector_to_byte(d) + ops) % opattern.size(); /* pattern start */
 			writeDone(ss, ns, opattern, ps);
 		}
 	} while (1);
 }
 
 void ioCompleted(void *cbdata, ManagedBuffer bufp, size_t size, uint64_t offset, ssize_t result, bool read) {
-	assert(cbdata && bufp && result == size);
+	assert(cbdata && bufp && result == size && size >= sector_to_byte(1));
 
 	disk     *diskp   = reinterpret_cast<disk *>(cbdata);
 	uint64_t sector   = bytes_to_sector(offset);
-	uint32_t nsectors = bytes_to_sector(size);
-	char     *bp      = bufp.get();
-	string   pattern;
+	uint16_t nsectors = bytes_to_sector(size);
+	assert(nsectors >= 1);
 
-	diskp->patternCreate(sector, nsectors, pattern);
 	if (read == true) {
-		diskp->readDone(bp, sector, nsectors, pattern);
+		char *bp = bufp.get();
+		diskp->readDone(bp, sector, nsectors);
 	} else {
-		diskp->writeDone(sector, nsectors, pattern, 0);
+		string p;
+		diskp->patternCreate(sector, nsectors, p);
+		diskp->writeDone(sector, nsectors, p, 0);
 	}
+}
 
-	diskp->iosSubmit(1);
+void nioCompleted(void *cbdata, uint16_t nios) {
+	assert(cbdata);
+
+	disk *diskp = reinterpret_cast<disk *>(cbdata);
+	diskp->iosSubmit(nios);
+}
+
+bool disk::runInEventBaseThread(folly::Function<void()> func) {
+	return base.runInEventBaseThread(std::move(func));
 }
 
 void disk::setIOMode(IOMode mode) {
 	this->mode_   = mode;
 	this->timeout = std::make_unique<TimeoutWrapper>(this, &base);
-	this->timeout->scheduleTimeout(MIN_TO_MILLI(1));
+	this->timeout->scheduleTimeout(SEC_TO_MILL(5));
 }
 
 void disk::switchIOMode() {
@@ -353,7 +463,7 @@ void disk::switchIOMode() {
 
 int disk::verify() {
 	asyncio.init(&base);
-	asyncio.registerIOCompleteCB(ioCompleted, this);
+	asyncio.registerCallback(ioCompleted, nioCompleted,this);
 
 	setIOMode(IOMode::WRITE);
 	auto rc = iosSubmit(iodepth);
@@ -361,7 +471,607 @@ int disk::verify() {
 
 	base.loopForever();
 	// rc = event_base_dispatch(ebp);
-	cout << "rc = " << rc << endl;
+}
+
+void disk::cleanupEverything() {
+	ios.erase(ios.begin(), ios.end());
+}
+
+void disk::testReadSubmit(uint64_t s, uint16_t ns) {
+	struct iocb *ios[1];
+	struct iocb cb;
+	size_t      sz;
+	uint64_t    o;
+	
+	sz        = sector_to_byte(ns);
+	o         = sector_to_byte(s);
+	auto bufp = getIOBuffer(sz);
+	ios[0]    = &cb;
+	asyncio.preadPrepare(&cb, fd, std::move(bufp), sz, o);
+
+	auto rc = asyncio.pread(ios, 1);
+	assert(rc == 1);
+}
+
+void disk::testWriteSubmit(uint64_t s, uint16_t ns) {
+	struct iocb *ios[1];
+	struct iocb cb;
+	size_t      sz;
+	uint64_t    o;
+
+	string p;
+	patternCreate(s, ns, p);
+
+	sz        = sector_to_byte(ns);
+	o         = sector_to_byte(s);
+	auto bufp = prepareIOBuffer(sz, p);
+	ios[0]    = &cb;
+	asyncio.pwritePrepare(&cb, fd, std::move(bufp), sz, o);
+
+	auto rc = asyncio.pwrite(ios, 1);
+	assert(rc == 1);
+}
+
+void disk::testWriteOnceReadMany() {
+	testWriteSubmit(512, 16);
+	base.loopOnce();
+	for (auto ns = 50; ns != 0; ns--) {
+		testReadSubmit(500, ns);
+		base.loopOnce();
+	}
+
+	testWriteSubmit(100, 9);
+	base.loopOnce();
+	for (auto ns = 50; ns != 0; ns--) {
+		testReadSubmit(100, ns);
+		base.loopOnce();
+	}
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testOverWrite() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+	for (auto step = 1; step < 16; step++) {
+		for (int16_t ns = 16, c = 0; ns > 0; ns-=step, c++) {
+			testWriteSubmit(512, ns);
+			base.loopOnce();
+			assert(ios.size() == c+1);
+			testReadSubmit(500, 50);
+			base.loopOnce();
+		}
+		cleanupEverything();
+		assert(ios.size() == 0);
+	}
+	assert(ios.size() == 0);
+
+	for (auto step = 1; step < 160; step++) {
+		for (int16_t ns = 160, c = 0; ns > 0; ns-=step, c++) {
+			testWriteSubmit(100, ns);
+			base.loopOnce();
+			assert(ios.size() == c+1);
+			testReadSubmit(98, 200);
+			base.loopOnce();
+		}
+		cleanupEverything();
+		assert(ios.size() == 0);
+	}
+	assert(ios.size() == 0);
+}
+
+void disk::testNO2() {
+/*
+W 8081398 1404
+W 8081398 909
+W 8081398 1093
+R 8082135 8
+*/
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(8081398, 1404);
+	base.loopOnce();
+	assert(ios.size() == 1);
+#if 0
+	cout << "1\n";
+	for (auto &io : ios) {
+		cout << io->r.sector << " " << io->r.nsectors << " " << io->pattern << " " << io->pattern_start << endl;
+	}
+#endif
+
+	testWriteSubmit(8081398, 909);
+	base.loopOnce();
+	assert(ios.size() == 2);
+
+	testWriteSubmit(8081398, 1093);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(8082135, 8);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testNO1() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	const uint64_t SECTOR = 1783797;
+
+	testWriteSubmit(SECTOR, 1207);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	for (auto &io : ios) {
+		string p;
+		patternCreate(SECTOR, 1207, p);
+		assert(io->r.sector == SECTOR && io->r.nsectors == 1207 &&
+				io->pattern == p && io->pattern_start == 0);
+	}
+
+	auto ns = 8;
+	auto sz = sector_to_byte(ns);
+	testWriteSubmit(SECTOR, ns);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	int c = 0;
+	for (auto &io : ios) {
+		if (c == 0) {
+			string p;
+			patternCreate(SECTOR, ns, p);
+			assert(io->r.sector == SECTOR && io->r.nsectors == ns &&
+					io->pattern == p && io->pattern_start == 0);
+		} else {
+			string p;
+			patternCreate(SECTOR, 1207, p);
+			auto ps = sz % p.length();
+			assert(io->r.sector == SECTOR+ns && io->r.nsectors == 1207-ns && 
+					io->pattern == p && io->pattern_start == ps);
+		}
+		c++;
+	}
+
+	auto ns1 = 16;
+	auto sz1 = sector_to_byte(ns1);
+	testWriteSubmit(SECTOR, 16);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	c = 0;
+	for (auto &io : ios) {
+		if (c == 0) {
+			string p;
+			patternCreate(SECTOR, ns1, p);
+			assert(io->r.sector == SECTOR && io->r.nsectors == ns1 &&
+					io->pattern == p && io->pattern_start == 0);
+		} else {
+			string p;
+			patternCreate(SECTOR, 1207, p);
+			auto ps = sz1 % p.length();
+			assert(io->r.sector == SECTOR+ns1 && io->r.nsectors == 1207-ns1 && 
+					io->pattern == p && io->pattern_start == ps);
+		}
+		c++;
+	}
+
+	testReadSubmit(1783797, 64);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testNoOverlap() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 3000);
+	base.loopOnce();
+
+	testWriteSubmit(2000, 500);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(1000, 3000);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testExactOverwrite() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testTailExactOverwrite() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	testWriteSubmit(1300, 200);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testHeadExactOverwrite() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	testWriteSubmit(1000, 100);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testDoubleSplit() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	testWriteSubmit(1200, 100);
+	base.loopOnce();
+	assert(ios.size() == 3);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testTailOverwrite() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	testWriteSubmit(1300, 500);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(1000, 1000);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testHeadOverwrite() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	testWriteSubmit(800, 500);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(500, 2000);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testCompleteOverwrite() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 100);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	testWriteSubmit(1000, 500);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(1000, 500);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testHeadSideSplit() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 2000);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1000, 100);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1000, 200);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1300, 200);
+	base.loopOnce();
+	assert(ios.size() == 4);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1600, 600);
+	base.loopOnce();
+	assert(ios.size() == 6);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1400, 600);
+	base.loopOnce();
+	assert(ios.size() == 6);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1100, 20);
+	base.loopOnce();
+	assert(ios.size() == 8);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testMid() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 2000);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1500, 50);
+	base.loopOnce();
+	assert(ios.size() == 3);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1300, 350);
+	base.loopOnce();
+	assert(ios.size() == 3);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1200, 500);
+	base.loopOnce();
+	assert(ios.size() == 3);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1600, 10);
+	base.loopOnce();
+	assert(ios.size() == 5);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1350, 300);
+	base.loopOnce();
+	assert(ios.size() == 5);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::testTailSideSplit() {
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(1000, 2000);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(2500, 500);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(2000, 1000);
+	base.loopOnce();
+	assert(ios.size() == 2);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(2200, 500);
+	base.loopOnce();
+	assert(ios.size() == 4);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(2200, 600);
+	base.loopOnce();
+	assert(ios.size() == 4);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(2100, 300);
+	base.loopOnce();
+	assert(ios.size() == 5);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1500, 300);
+	base.loopOnce();
+	assert(ios.size() == 7);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	testWriteSubmit(1700, 500);
+	base.loopOnce();
+	assert(ios.size() == 6);
+	testReadSubmit(800, 2500);
+	base.loopOnce();
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::_testSectorReads(uint64_t sector, uint16_t nsectors) {
+	uint64_t s;
+	uint16_t ns;
+	for (s = sector, ns = 0; ns < nsectors; ns++, s++) {
+		testReadSubmit(s, 1);
+		base.loopOnce();
+	}
+}
+
+void disk::testSectorReads() {
+	const uint64_t SECTOR   = 1000;
+	const uint16_t NSECTORS = 500;
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+
+	testWriteSubmit(SECTOR, NSECTORS);
+	base.loopOnce();
+	assert(ios.size() == 1);
+	_testSectorReads(SECTOR, NSECTORS);
+
+	for (auto s = SECTOR; s < (SECTOR + NSECTORS); s += 2) {
+		testWriteSubmit(s, 1);
+		_testSectorReads(SECTOR, NSECTORS);
+	}
+
+	cleanupEverything();
+	assert(ios.size() == 0);
+}
+
+void disk::test() {
+	asyncio.init(&base);
+	asyncio.registerCallback(ioCompleted, nullptr, this);
+
+	testWriteOnceReadMany();
+	testOverWrite();
+	testNO1();
+	testNO2();
+	testNoOverlap();
+	testNoOverlap();
+	testExactOverwrite();
+	testTailExactOverwrite();
+	testHeadExactOverwrite();
+	testDoubleSplit();
+	testTailOverwrite();
+	testHeadOverwrite();
+	testCompleteOverwrite();
+	testHeadSideSplit();
+	testMid();
+	testTailSideSplit();
+	testSectorReads();
+}
+
+void lineSplit(const string &line, const char delim, vector<string> &result) {
+	std::stringstream ss;
+	ss.str(line);
+	string item;
+	while (std::getline(ss, item, delim)) {
+		result.emplace_back(item);
+	}
+}
+
+#include <fstream>
+
+void disk::testBlockTrace(const string &file) {
+	asyncio.init(&base);
+	asyncio.registerCallback(ioCompleted, nullptr, this);
+
+	std::ifstream ifs(file);
+	if (!ifs.is_open()) {
+		return;
+	}
+
+	range tr(8082135, 8);
+	string line;
+	while (std::getline(ifs, line)) {
+		std::vector<string> l;
+		lineSplit(line, ' ', l);
+		if (l.size() != 3) {
+			cout << "Unabled to parse trace " << line << endl;
+			continue;
+		}
+
+		uint64_t s  = std::stoul(l[1]);
+		uint16_t ns = std::stoul(l[2]);
+		range r(s, ns);
+
+		if ((tr.sector >= s && tr.sector <= r.end_sector()) || (tr.end_sector() >= s && tr.end_sector() <= r.end_sector())) {
+			if (l[0] == "W") {
+				cout << "W " << s << " " << ns << endl;
+				testWriteSubmit(s, ns);
+			} else if (l[0] == "R") {
+				cout << "R " << s << " " << ns << endl;
+				testReadSubmit(s, ns);
+			} else {
+				cout << "Unrecognized operation " << l[0] << endl;
+				continue;
+			}
+			base.loopOnce();
+		}
+	}
 }
 #if 0
 void disk::print_ios(void)

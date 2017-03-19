@@ -24,6 +24,7 @@
 #define MIN_TO_SEC(min)   ((min) * 60)
 #define SEC_TO_MILL(sec)  ((sec) * 1000)
 #define MIN_TO_MILLI(min) (SEC_TO_MILL(MIN_TO_SEC((min))))
+#define MIN(n1, n2)       ((n1) <= (n2) ? (n1) : (n2))
 
 using std::string;
 using std::set;
@@ -125,6 +126,8 @@ protected:
 
 	ManagedBuffer getIOBuffer(size_t size);
 	ManagedBuffer prepareIOBuffer(size_t size, const string &pattern);
+	bool patternCompare(const char *const bufp, size_t size, const string &pattern, int16_t start);
+	bool readDataVerify(const char *const data, uint64_t sector, uint16_t nsectors);
 
 public:
 	class TimeoutWrapper : public AsyncTimeout {
@@ -148,7 +151,7 @@ public:
 
 	void patternCreate(uint64_t sector, uint16_t nsectors, string &pattern);
 	void writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, const int16_t pattern_start);
-	void readDone(const char *const data, uint64_t sector, uint16_t nsectors, const string &pattern);
+	void readDone(const char *const bufp, uint64_t sector, uint16_t nsectors);
 	int  iosSubmit(uint64_t nios);
 //	void print_ios(void);
 
@@ -163,9 +166,34 @@ public:
 		return fd;
 	}
 
+	bool runInEventBaseThread(folly::Function<void()>);
 private:
 	IOMode mode_;
 	unique_ptr<TimeoutWrapper> timeout;
+
+public: /* some test APIs */
+	void cleanupEverything();
+	void testReadSubmit(uint64_t s, uint16_t ns);
+	void testWriteSubmit(uint64_t s, uint16_t ns);
+	void testWriteOnceReadMany();
+	void testOverWrite();
+	void testBlockTrace(const string &file);
+	void testNO1();
+	void testNO2();
+	void testNoOverlap();
+	void testExactOverwrite();
+	void testTailExactOverwrite();
+	void testHeadExactOverwrite();
+	void testDoubleSplit();
+	void testTailOverwrite();
+	void testHeadOverwrite();
+	void testCompleteOverwrite();
+	void testHeadSideSplit();
+	void testMid();
+	void testTailSideSplit();
+	void testSectorReads();
+	void _testSectorReads(uint64_t sector, uint16_t nsectors);
+	void test();
 };
 
 #endif

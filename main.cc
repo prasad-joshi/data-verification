@@ -19,7 +19,7 @@ int main(int argc, char *argv[])
 	sizes.push_back(std::make_pair((1024*1024)>>9, 1));
 
 	string path("/dev/vdb");
-	disk   sdb(path, sizes, 32);
-	sdb.verify();
+	disk   sdb(path, sizes, 1);
+	sdb.test();
 	return 0;
 }

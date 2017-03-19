@@ -67,9 +67,10 @@ void AsyncIO::init(EventBase *basep) {
 	initialized_ = true;
 }
 
-void AsyncIO::registerIOCompleteCB(IOCompCB cb, void *cbdata) {
-	cbp_     = cb;
+void AsyncIO::registerCallback(IOCompleteCB iocb, NIOSCompleteCB niocb, void *cbdata) {
+	iocbp_   = iocb;
 	cbdatap_ = cbdata;
+	niocbp_   = niocb;
 }
 
 ssize_t AsyncIO::ioResult(struct io_event *ep) {
@@ -77,9 +78,10 @@ ssize_t AsyncIO::ioResult(struct io_event *ep) {
 }
 
 void AsyncIO::iosCompleted() {
-	assert(cbp_ && eventfd_ >= 0);
+	assert(iocbp_ && eventfd_ >= 0);
 
 	eventfd_t nevents;
+	uint16_t  completed = 0;
 
 	while (1) {
 		int rc = eventfd_read(eventfd_, &nevents);
@@ -105,11 +107,15 @@ void AsyncIO::iosCompleted() {
 			} else {
 				this->nbytesWrote += iop->size_;
 			}
-			cbp_(cbdatap_, std::move(iop->bufp_), iop->size_, iop->offset_, result, read);
+			iocbp_(cbdatap_, std::move(iop->bufp_), iop->size_, iop->offset_, result, read);
 			delete iop;
 		}
+		completed += nevents;
+	}
 
-		this->ncompleted += nevents;
+	this->ncompleted += completed;
+	if (niocbp_) {
+		niocbp_(cbdatap_, completed);
 	}
 }
 

@@ -10,8 +10,8 @@ using std::unique_ptr;
 using std::shared_ptr;
 
 typedef unique_ptr<char, void(*)(void*)> ManagedBuffer;
-typedef std::function<void(void *cbdata, ManagedBuffer bufp, size_t size, uint64_t offset, ssize_t result, bool read)> IOCompCB;
-typedef std::function<void(void *cbdata, uint16_t nios)> NIOSCompCB;
+typedef std::function<void(void *cbdata, ManagedBuffer bufp, size_t size, uint64_t offset, ssize_t result, bool read)> IOCompleteCB;
+typedef std::function<void(void *cbdata, uint16_t nios)> NIOSCompleteCB;
 
 class AsyncIO {
 private:
@@ -27,8 +27,8 @@ private:
 	uint64_t       nbytesRead;
 	uint64_t       nbytesWrote;
 private:
-	NIOSCompCB     ncbp_;
-	IOCompCB       cbp_;
+	NIOSCompleteCB niocbp_;
+	IOCompleteCB   iocbp_;
 	void           *cbdatap_;
 
 private:
@@ -58,7 +58,7 @@ public:
 	~AsyncIO();
 
 	void init(EventBase *basep);
-	void registerIOCompleteCB(IOCompCB cb, void *cbdata);
+	void registerCallback(IOCompleteCB iocb, NIOSCompleteCB niocb, void *cbdata);
 	void iosCompleted();
 	void pwritePrepare(struct iocb *cbp, int fd, ManagedBuffer bufp, size_t size, uint64_t offset);
 	int  pwrite(struct iocb **iocbpp, int nwrites);
