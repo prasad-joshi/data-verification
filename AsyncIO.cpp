@@ -84,7 +84,8 @@ void AsyncIO::iosCompleted() {
 	uint16_t  completed = 0;
 
 	while (1) {
-		int rc = eventfd_read(eventfd_, &nevents);
+		nevents = 0;
+		int rc  = eventfd_read(eventfd_, &nevents);
 		if (rc < 0 || nevents == 0) {
 			if (rc < 0 && errno != EAGAIN) {
 				assert(0);
@@ -94,6 +95,7 @@ void AsyncIO::iosCompleted() {
 			break;
 		}
 
+		assert(nevents > 0);
 		struct io_event events[nevents];
 		rc = io_getevents(context_, nevents, nevents, events, NULL);
 		assert(rc == nevents);
@@ -119,6 +121,10 @@ void AsyncIO::iosCompleted() {
 	}
 }
 
+uint64_t AsyncIO::getPending() {
+	return this->nsubmitted - this->ncompleted;
+}
+
 void AsyncIO::pwritePrepare(struct iocb *iocbp, int fd, ManagedBuffer bufp, size_t size, uint64_t offset) {
 	assert(initialized_ && iocbp && bufp && fd >= 0);
 	std::memset(iocbp, 0, sizeof(*iocbp));
@@ -133,8 +139,8 @@ void AsyncIO::pwritePrepare(struct iocb *iocbp, int fd, ManagedBuffer bufp, size
 
 int AsyncIO::pwrite(struct iocb **iocbpp, int nwrites) {
 	assert(initialized_ && iocbpp && nwrites);
-	this->nwrites += nwrites;
-	this->nsubmitted++;
+	this->nwrites    += nwrites;
+	this->nsubmitted += nwrites;
 	return io_submit(context_, nwrites, iocbpp);
 }
 
@@ -152,8 +158,8 @@ void AsyncIO::preadPrepare(struct iocb *iocbp, int fd, ManagedBuffer bufp, size_
 
 int AsyncIO::pread(struct iocb **iocbpp, int nreads) {
 	assert(initialized_ && iocbpp && nreads);
-	this->nreads += nreads;
-	this->nsubmitted++;
+	this->nreads     += nreads;
+	this->nsubmitted += nreads;
 	return io_submit(context_, nreads, iocbpp);
 }
 

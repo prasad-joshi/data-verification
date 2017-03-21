@@ -118,6 +118,7 @@ private:
 	AsyncIO               asyncio;
 	std::mutex            lock;
 	set<IOPtr, IOCompare> ios;
+	vector<pair<range, bool>> writeIOsSubmitted;
 
 protected:
 	void setIOMode(IOMode mode);
@@ -128,7 +129,11 @@ protected:
 	ManagedBuffer prepareIOBuffer(size_t size, const string &pattern);
 	bool patternCompare(const char *const bufp, size_t size, const string &pattern, int16_t start);
 	bool readDataVerify(const char *const data, uint64_t sector, uint16_t nsectors);
+	void patternCreate(uint64_t sector, uint16_t nsectors, string &pattern);
+	void writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, const int16_t pattern_start);
 
+	void addWriteIORange(uint64_t sector, uint16_t nsectors);
+	pair<range, bool> removeWriteIORange(uint64_t sector, uint16_t nsectors);
 public:
 	class TimeoutWrapper : public AsyncTimeout {
 	private:
@@ -149,8 +154,7 @@ public:
 	void switchIOMode();
 	int  verify();
 
-	void patternCreate(uint64_t sector, uint16_t nsectors, string &pattern);
-	void writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, const int16_t pattern_start);
+	void writeDone(uint64_t sector, uint16_t nsectors);
 	void readDone(const char *const bufp, uint64_t sector, uint16_t nsectors);
 	int  iosSubmit(uint64_t nios);
 //	void print_ios(void);
@@ -170,6 +174,7 @@ public:
 private:
 	IOMode mode_;
 	unique_ptr<TimeoutWrapper> timeout;
+	bool modeSwitched_;
 
 public: /* some test APIs */
 	void cleanupEverything();

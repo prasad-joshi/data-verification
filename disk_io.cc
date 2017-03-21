@@ -85,6 +85,7 @@ disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes, uint16_t qdepth) 
 	this->size    = sz;
 	this->sectors = bytes_to_sector(sz);
 	this->iogen   = std::make_unique<io_generator>(0, this->sectors, sizes);
+	modeSwitched_ = false;
 }
 
 disk::~disk() {
@@ -122,6 +123,43 @@ ManagedBuffer disk::getIOBuffer(size_t size) {
 	return asyncio.getIOBuffer(size);
 }
 
+void disk::addWriteIORange(uint64_t sector, uint16_t nsectors) {
+	range nr(sector, nsectors);
+	bool  c = true;
+
+	for (auto &it : writeIOsSubmitted) {
+		if (nr < it.first || it.first < nr) {
+			/* not equal */
+			continue;
+		}
+		c         = false;
+		it.second = false;
+	}
+
+	pair<range, bool> p(nr, c);
+	writeIOsSubmitted.push_back(p);
+}
+
+pair<range, bool> disk::removeWriteIORange(uint64_t sector, uint16_t nsectors) {
+	range             nr(sector, nsectors);
+	pair<range, bool> res;
+	bool              found = false;
+
+	auto it = writeIOsSubmitted.begin();
+	while (it != writeIOsSubmitted.end()) {
+		if (nr < it->first || it->first < nr) {
+			it++;
+			continue;
+		}
+		res = *it;
+		writeIOsSubmitted.erase(it);
+		found = true;
+		break;
+	}
+	assert(found == true);
+	return res;
+}
+
 int disk::writesSubmit(uint64_t nwrites) {
 	struct iocb *ios[nwrites];
 	struct iocb cbs[nwrites];
@@ -146,6 +184,7 @@ int disk::writesSubmit(uint64_t nwrites) {
 		cbp       = &cbs[i];
 		ios[i]    = cbp;
 		asyncio.pwritePrepare(cbp, fd, std::move(bufp), sz, o);
+		addWriteIORange(s, ns);
 	}
 
 	auto rc = asyncio.pwrite(ios, nwrites);
@@ -189,6 +228,19 @@ int disk::readsSubmit(uint64_t nreads) {
 int disk::iosSubmit(uint64_t nios) {
 	int rc;
 
+	if (modeSwitched_ == true) {
+		/* wait till all submitted IOs are complete */
+		if (asyncio.getPending() != 0) {
+			return 0;
+		}
+
+		// cout << "No pending IOs.\n";
+		nios = iodepth;
+		modeSwitched_ = false;
+		// sleep(10);
+	}
+
+	assert(modeSwitched_ == false);
 	switch (mode_) {
 	case IOMode::WRITE:
 		rc = writesSubmit(nios);
@@ -306,8 +358,35 @@ void disk::readDone(const char *const bufp, uint64_t sector, uint16_t nsectors) 
 	}
 }
 
+void disk::writeDone(uint64_t sector, uint16_t nsectors) {
+	auto pr = removeWriteIORange(sector, nsectors);
+	if (pr.second == false) {
+		/*
+		 * TODO: improve this
+		 *
+		 * IO on same range of sectors was submitted simultaneously. There is
+		 * no simple way to verify data. At the moment, we remove all traces
+		 * of the related IOs.
+		 */
+		while (1) {
+			auto io = ios.find(pr.first);
+			if (io == ios.end()) {
+				break;
+			}
+			ios.erase(io);
+		}
+		assert(ios.find(pr.first) == ios.end());
+		return;
+	}
+
+	string p;
+	patternCreate(sector, nsectors, p);
+	writeDone(sector, nsectors, p, 0);
+}
+
 void disk::writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, const int16_t pattern_start) {
 	range r(sector, nsectors);
+
 	auto nios = r.start_sector(); /* new IO start sector */
 	auto nioe = r.end_sector();   /* new IO end sector   */
 
@@ -423,9 +502,7 @@ void ioCompleted(void *cbdata, ManagedBuffer bufp, size_t size, uint64_t offset,
 		char *bp = bufp.get();
 		diskp->readDone(bp, sector, nsectors);
 	} else {
-		string p;
-		diskp->patternCreate(sector, nsectors, p);
-		diskp->writeDone(sector, nsectors, p, 0);
+		diskp->writeDone(sector, nsectors);
 	}
 }
 
@@ -443,10 +520,12 @@ bool disk::runInEventBaseThread(folly::Function<void()> func) {
 void disk::setIOMode(IOMode mode) {
 	this->mode_   = mode;
 	this->timeout = std::make_unique<TimeoutWrapper>(this, &base);
-	this->timeout->scheduleTimeout(SEC_TO_MILL(5));
+	this->timeout->scheduleTimeout(MIN_TO_MILLI(5));
 }
 
 void disk::switchIOMode() {
+	assert(modeSwitched_ == false);
+
 	IOMode m;
 	switch (this->mode_) {
 	case IOMode::WRITE:
@@ -458,6 +537,7 @@ void disk::switchIOMode() {
 		cout << "Setting IO Mode to WRITE\n";
 		break;
 	}
+	modeSwitched_ = true;
 
 	base.runInEventBaseThread([dpCap = this, mode = m] () {
 		dpCap->setIOMode(mode);

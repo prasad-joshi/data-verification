@@ -65,6 +65,7 @@ public:
 	void preadPrepare(struct iocb *cbp, int fd, ManagedBuffer bufp, size_t size, uint64_t offset);
 	int  pread(struct iocb **iocbpp, int nwrites);
 	ManagedBuffer getIOBuffer(size_t size);
+	uint64_t getPending();
 
 private:
 	EventFDHandler *handlerp_;
