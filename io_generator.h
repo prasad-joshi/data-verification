@@ -50,7 +50,7 @@ public:
 	io_generator(uint64_t sector, uint64_t nsectors,
 			vector<pair<uint32_t, uint8_t>> &sizes) :
 		size_rand(1, 1, MAX_SECTORS),
-		sector_rand(1.2, nsectors - MAX_SECTORS, 1)
+		sector_rand(0.9, nsectors - MAX_SECTORS, 1)
 	{
 		uint32_t seed = 1;
 

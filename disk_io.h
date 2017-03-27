@@ -22,8 +22,8 @@
 #include "AsyncIO.h"
 
 #define MIN_TO_SEC(min)   ((min) * 60)
-#define SEC_TO_MILL(sec)  ((sec) * 1000)
-#define MIN_TO_MILLI(min) (SEC_TO_MILL(MIN_TO_SEC((min))))
+#define SEC_TO_MILLI(sec) ((sec) * 1000)
+#define MIN_TO_MILLI(min) (SEC_TO_MILLI(MIN_TO_SEC((min))))
 #define MIN(n1, n2)       ((n1) <= (n2) ? (n1) : (n2))
 
 using std::string;
@@ -33,6 +33,8 @@ using std::shared_ptr;
 using std::pair;
 using std::unique_ptr;
 using namespace folly;
+
+using TimeOutCB = std::function<void(void *cbdata)>;
 
 enum class IOMode {
 	WRITE,
@@ -105,12 +107,12 @@ struct IOCompare {
 
 class disk {
 private:
-	string       path;
+	string       path_;
 	uint64_t     size;
-	uint64_t     sectors;
+	uint64_t     sectors_;
 	int          fd;
-	uint64_t     total_writes;
-	uint16_t     iodepth;
+	uint16_t     iodepth_;
+	uint16_t     percent_;
 	unique_ptr<io_generator> iogen;
 
 private:
@@ -124,6 +126,7 @@ protected:
 	void setIOMode(IOMode mode);
 	int  writesSubmit(uint64_t nreads);
 	int  readsSubmit(uint64_t nreads);
+	void setRuntimeTimer();
 
 	ManagedBuffer getIOBuffer(size_t size);
 	ManagedBuffer prepareIOBuffer(size_t size, const string &pattern);
@@ -137,19 +140,20 @@ protected:
 public:
 	class TimeoutWrapper : public AsyncTimeout {
 	private:
-		TimeoutManager *mp_;
-		disk           *dp_;
+		void      *cbdatap_;
+		TimeOutCB cb_;
 	public:
-		TimeoutWrapper(disk *dp, TimeoutManager *mp) :
-				dp_(dp), mp_(mp), AsyncTimeout(mp) {
+		TimeoutWrapper(TimeoutManager *mp, TimeOutCB cb, void *cbdatap) :
+				AsyncTimeout(mp), cb_(cb), cbdatap_(cbdatap) {
 		}
 
 		void timeoutExpired() noexcept {
-			dp_->switchIOMode();
+			cb_(cbdatap_);
 		}
 	};
 
-	disk(string path, vector<pair<uint32_t, uint8_t>> sizes, uint16_t qdepth);
+	disk(string path, uint16_t percent, vector<pair<uint32_t, uint8_t>> sizes,
+			uint16_t iodepth, uint64_t runtime);
 	~disk();
 	void switchIOMode();
 	int  verify();
@@ -163,18 +167,26 @@ public:
 		return ios.size();
 	}
 	uint64_t nsectors() {
-		return sectors;
+		return sectors_;
+	}
+	uint64_t ioNSectors() {
+		return sectors_ * percent_ / 100;
 	}
 
 	int disk_fd(void) {
 		return fd;
 	}
 
+	void runtimeExpired();
 	bool runInEventBaseThread(folly::Function<void()>);
 private:
-	IOMode mode_;
-	unique_ptr<TimeoutWrapper> timeout;
-	bool modeSwitched_;
+	IOMode                     mode_;
+	unique_ptr<TimeoutWrapper> ioModeSwitchTimer_;
+	bool                       modeSwitched_;
+
+	uint64_t                   runtime_;
+	unique_ptr<TimeoutWrapper> runtimeTimer_;
+	bool                       runtimeComplete_ = false;
 
 public: /* some test APIs */
 	void cleanupEverything();

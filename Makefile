@@ -1,5 +1,5 @@
 INC := -I.
-LIBS := -levent -laio -lpthread -lfolly
+LIBS := -levent -laio -lpthread -lfolly -lgflags
 CPPCLAGS := -g -ggdb -O0
 
 all: main

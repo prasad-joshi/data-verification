@@ -60,7 +60,10 @@ uint64_t IO::offset() {
 	return sector_to_byte(r.sector);
 }
 
-disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes, uint16_t qdepth) : asyncio(qdepth) {
+disk::disk(string path, uint16_t percent, vector<pair<uint32_t, uint8_t>> sizes,
+			uint16_t iodepth, uint64_t runtime) :
+				asyncio(iodepth), path_(path), percent_(percent), iodepth_(iodepth),
+				runtime_(runtime), modeSwitched_(false), fd(-1) {
 	fd = open(path.c_str(), O_RDWR | O_DIRECT);
 	if (fd < 0) {
 		throw runtime_error("Could not open file " + path);
@@ -80,12 +83,10 @@ disk::disk(string path, vector<pair<uint32_t, uint8_t>> sizes, uint16_t qdepth) 
 	}
 	assert(sz != 0);
 
-	this->iodepth = qdepth;
-	this->path    = path;
-	this->size    = sz;
-	this->sectors = bytes_to_sector(sz);
-	this->iogen   = std::make_unique<io_generator>(0, this->sectors, sizes);
-	modeSwitched_ = false;
+	this->size     = sz;
+	this->sectors_ = bytes_to_sector(sz);
+	auto ns        = this->sectors_ * percent / 100;
+	this->iogen    = std::make_unique<io_generator>(0, ns, sizes);
 }
 
 disk::~disk() {
@@ -147,14 +148,13 @@ pair<range, bool> disk::removeWriteIORange(uint64_t sector, uint16_t nsectors) {
 
 	auto it = writeIOsSubmitted.begin();
 	while (it != writeIOsSubmitted.end()) {
-		if (nr < it->first || it->first < nr) {
-			it++;
-			continue;
+		if (it->first.sector == sector && it->first.nsectors == nsectors) {
+			res = *it;
+			writeIOsSubmitted.erase(it);
+			found = true;
+			break;
 		}
-		res = *it;
-		writeIOsSubmitted.erase(it);
-		found = true;
-		break;
+		it++;
 	}
 	assert(found == true);
 	return res;
@@ -171,7 +171,7 @@ int disk::writesSubmit(uint64_t nwrites) {
 
 	for (auto i = 0; i < nwrites; i++) {
 		iogen->next_io(&s, &ns);
-		assert(ns >= 1 && s <= sectors && s+ns <= sectors);
+		assert(ns >= 1 && s <= sectors_ && s+ns <= sectors_);
 
 		// cout << "W " << s << " " << ns << endl;
 
@@ -206,7 +206,7 @@ int disk::readsSubmit(uint64_t nreads) {
 	
 	for (auto i = 0; i < nreads; i++) {
 		iogen->next_io(&s, &ns);
-		assert(ns >= 1 && s <= sectors && s+ns <= sectors);
+		assert(ns >= 1 && s <= sectors_ && s+ns <= sectors_);
 
 		// cout << "R " << s << " " << ns << endl;
 		sz        = sector_to_byte(ns);
@@ -234,10 +234,15 @@ int disk::iosSubmit(uint64_t nios) {
 			return 0;
 		}
 
-		// cout << "No pending IOs.\n";
-		nios = iodepth;
+		nios = iodepth_;
 		modeSwitched_ = false;
-		// sleep(10);
+	}
+
+	if (runtimeComplete_ == true) {
+		if (asyncio.getPending() == 0) {
+			base.terminateLoopSoon();
+		}
+		return 0;
 	}
 
 	assert(modeSwitched_ == false);
@@ -517,10 +522,16 @@ bool disk::runInEventBaseThread(folly::Function<void()> func) {
 	return base.runInEventBaseThread(std::move(func));
 }
 
+/* IO mode and it's timer */
+static void switchIOModeTCB(void *cbdp) {
+	disk *dp = reinterpret_cast<disk *>(cbdp);
+	dp->switchIOMode();
+}
+
 void disk::setIOMode(IOMode mode) {
-	this->mode_   = mode;
-	this->timeout = std::make_unique<TimeoutWrapper>(this, &base);
-	this->timeout->scheduleTimeout(MIN_TO_MILLI(5));
+	this->mode_              = mode;
+	this->ioModeSwitchTimer_ = std::make_unique<TimeoutWrapper>(&base, switchIOModeTCB, this);
+	this->ioModeSwitchTimer_->scheduleTimeout(MIN_TO_MILLI(5));
 }
 
 void disk::switchIOMode() {
@@ -544,12 +555,32 @@ void disk::switchIOMode() {
 	});
 }
 
+/* runtime and it's timer handling */
+static void runtimeExpiredTCB(void *cbdp) {
+	disk *dp = reinterpret_cast<disk *>(cbdp);
+	dp->runtimeExpired();
+}
+
+void disk::runtimeExpired() {
+	runtimeComplete_ = true;
+	if (asyncio.getPending() == 0) {
+		base.terminateLoopSoon();
+	}
+}
+
+void disk::setRuntimeTimer() {
+	assert(runtimeComplete_ == false);
+	runtimeTimer_ = std::make_unique<TimeoutWrapper>(&base, runtimeExpiredTCB, this);
+	runtimeTimer_->scheduleTimeout(SEC_TO_MILLI(runtime_));
+}
+
 int disk::verify() {
 	asyncio.init(&base);
-	asyncio.registerCallback(ioCompleted, nioCompleted,this);
+	asyncio.registerCallback(ioCompleted, nioCompleted, this);
 
 	setIOMode(IOMode::WRITE);
-	auto rc = iosSubmit(iodepth);
+	setRuntimeTimer();
+	auto rc = iosSubmit(iodepth_);
 	assert(rc == 0);
 
 	base.loopForever();
