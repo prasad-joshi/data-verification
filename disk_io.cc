@@ -531,7 +531,7 @@ static void switchIOModeTCB(void *cbdp) {
 void disk::setIOMode(IOMode mode) {
 	this->mode_              = mode;
 	this->ioModeSwitchTimer_ = std::make_unique<TimeoutWrapper>(&base, switchIOModeTCB, this);
-	this->ioModeSwitchTimer_->scheduleTimeout(MIN_TO_MILLI(5));
+	this->ioModeSwitchTimer_->scheduleTimeout(MIN_TO_MILLI(1));
 }
 
 void disk::switchIOMode() {

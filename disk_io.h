@@ -163,12 +163,17 @@ public:
 	int  iosSubmit(uint64_t nios);
 //	void print_ios(void);
 
-	uint64_t total_ios(void) {
-		return ios.size();
+	uint64_t getStats(uint64_t *nreadsp, uint64_t *nwritesp, uint64_t *nreadBytesp, uint64_t *nwroteBytes) {
+		*nreadsp = asyncio.getNReads();
+		*nwritesp = asyncio.getNWrites();
+		*nreadBytesp = asyncio.getBytesRead();
+		*nwroteBytes = asyncio.getBytesWrote();
 	}
+
 	uint64_t nsectors() {
 		return sectors_;
 	}
+
 	uint64_t ioNSectors() {
 		return sectors_ * percent_ / 100;
 	}

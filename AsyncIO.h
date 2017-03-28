@@ -67,6 +67,21 @@ public:
 	ManagedBuffer getIOBuffer(size_t size);
 	uint64_t getPending();
 
+	uint64_t getNWrites() const {
+		return nwrites ;
+	}
+
+	uint64_t getNReads() const {
+		return nreads;
+	}
+
+	uint64_t getBytesRead() const {
+		return nbytesRead;
+	}
+
+	uint64_t getBytesWrote() const {
+		return nbytesWrote;
+	}
 private:
 	EventFDHandler *handlerp_;
 };

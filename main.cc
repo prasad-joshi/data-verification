@@ -35,6 +35,27 @@ vector<string> split(const string &str, char delim) {
 	return tokens;
 }
 
+void bytesToHumanReadable(uint64_t nbytes, uint64_t &valp, string &unitp) {
+	vector<string> units = {
+		"B",
+		"KB",
+		"MB",
+		"GB",
+		"TB",
+	};
+	for (auto i = 0; i < 4; i++) {
+		auto t = nbytes;
+		nbytes >>= 10;
+		if (nbytes == 0) {
+			valp  = t;
+			unitp = units[i];
+			return;
+		}
+	}
+	valp  = nbytes;
+	unitp = "TB";
+}
+
 int main(int argc, char *argv[]) {
 	google::ParseCommandLineFlags(&argc, &argv, true);
 
@@ -76,7 +97,7 @@ int main(int argc, char *argv[]) {
 
 	/* check percentage */
 	if (FLAGS_percent <= 0 || FLAGS_percent > 100) {
-		throw std::invalid_argument("iodepth > 0 and iodepth < 512");
+		throw std::invalid_argument("percent > 0 and percent < 100");
 	}
 
 	/* check runtime */
@@ -129,8 +150,20 @@ int main(int argc, char *argv[]) {
 	cout << "IODepth " << FLAGS_iodepth << endl;
 	cout << "Runtime " << runtime << " seconds\n";
 
-#if 1
 	d1.verify();
-#endif
+
+	uint64_t nr, nw, nbr, nbw;
+	d1.getStats(&nr, &nw, &nbr, &nbw);
+	uint64_t r;
+	string ur;
+	bytesToHumanReadable(nbr, r, ur);
+	uint64_t w;
+	string uw;
+	bytesToHumanReadable(nbw, w, uw);
+
+	cout << endl;
+	cout << "Total IOs " << nr + nw << endl;
+	cout << "Read (Verification) IOs " << nr << " Read (Verified) Bytes " << nbr << " (" << r << ur << ")" << endl;
+	cout << "Write IOs " << nw << " Wrote Bytes " << nbw << " (" << w << uw << ")" << endl;
 	return 0;
 }
