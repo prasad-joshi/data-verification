@@ -20,6 +20,7 @@
 #include "io_generator.h"
 #include "zipf.h"
 #include "AsyncIO.h"
+#include "block_trace.h"
 
 #define MIN_TO_SEC(min)   ((min) * 60)
 #define SEC_TO_MILLI(sec) ((sec) * 1000)
@@ -35,6 +36,19 @@ using std::unique_ptr;
 using namespace folly;
 
 using TimeOutCB = std::function<void(void *cbdata)>;
+
+struct Corruption: public std::runtime_error {
+	uint64_t sector;
+	uint16_t nsectors;
+	string   readLine;
+	string   pattern;
+
+	Corruption(uint64_t sector_, uint16_t nsectors_, const string &readline_, const string &pattern_) :
+			sector(sector_), nsectors(nsectors_), readLine(readline_), pattern(pattern_),
+			std::runtime_error("Corruption") {
+
+	}
+};
 
 enum class IOMode {
 	WRITE,
@@ -114,6 +128,7 @@ private:
 	uint16_t     iodepth_;
 	uint16_t     percent_;
 	unique_ptr<io_generator> iogen;
+	TraceLog     trace_;
 
 private:
 	folly::EventBase      base;
@@ -130,7 +145,8 @@ protected:
 
 	ManagedBuffer getIOBuffer(size_t size);
 	ManagedBuffer prepareIOBuffer(size_t size, const string &pattern);
-	bool patternCompare(const char *const bufp, size_t size, const string &pattern, int16_t start);
+	bool patternCompare(uint64_t s, uint16_t ns, const char *const bufp,
+		size_t size, const string &pattern, int16_t start);
 	bool readDataVerify(const char *const data, uint64_t sector, uint16_t nsectors);
 	void patternCreate(uint64_t sector, uint16_t nsectors, string &pattern);
 	void writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, const int16_t pattern_start);

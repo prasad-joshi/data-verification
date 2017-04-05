@@ -63,7 +63,8 @@ uint64_t IO::offset() {
 disk::disk(string path, uint16_t percent, vector<pair<uint32_t, uint8_t>> sizes,
 			uint16_t iodepth, uint64_t runtime) :
 				asyncio(iodepth), path_(path), percent_(percent), iodepth_(iodepth),
-				runtime_(runtime), modeSwitched_(false), fd(-1) {
+				runtime_(runtime), modeSwitched_(false), fd(-1),
+				trace_("/tmp/log.dat") {
 	fd = open(path.c_str(), O_RDWR | O_DIRECT);
 	if (fd < 0) {
 		throw runtime_error("Could not open file " + path);
@@ -185,6 +186,7 @@ int disk::writesSubmit(uint64_t nwrites) {
 		ios[i]    = cbp;
 		asyncio.pwritePrepare(cbp, fd, std::move(bufp), sz, o);
 		addWriteIORange(s, ns);
+		trace_.addTraceLog(s, ns, false);
 	}
 
 	auto rc = asyncio.pwrite(ios, nwrites);
@@ -215,6 +217,7 @@ int disk::readsSubmit(uint64_t nreads) {
 		cbp       = &cbs[i];
 		ios[i]    = cbp;
 		asyncio.preadPrepare(cbp, fd, std::move(bufp), sz, o);
+		trace_.addTraceLog(s, ns, true);
 	}
 
 	auto rc = asyncio.pread(ios, nreads);
@@ -257,7 +260,10 @@ int disk::iosSubmit(uint64_t nios) {
 	return rc;
 }
 
-bool disk::patternCompare(const char *const bufp, size_t size, const string &pattern, int16_t start) {
+bool disk::patternCompare(uint64_t sector, uint16_t nsectors,
+			const char *const bufp, size_t size, const string &pattern,
+			int16_t start) {
+
 	assert(bufp && pattern.length() && pattern.length() >= start &&
 			size > pattern.length() && size >= 512 && pattern.length() < 512);
 
@@ -272,7 +278,11 @@ bool disk::patternCompare(const char *const bufp, size_t size, const string &pat
 		auto rc = std::memcmp(bp, p + start, cl);
 		if (rc != 0) {
 			/* corruption */
-			assert(0);
+			string r;
+			for (auto x = 0; x < cl; x++) {
+				r += *(bp + x);
+			}
+			throw Corruption(sector, nsectors, r, pattern);
 			return true;
 		}
 		bp    += cl;
@@ -283,6 +293,8 @@ bool disk::patternCompare(const char *const bufp, size_t size, const string &pat
 	auto rc = std::memcmp(bp, p, i);
 	if (rc != 0) {
 		/* corruption */
+		string r(bp);
+		throw Corruption(sector, nsectors, r, pattern);
 		return true;
 	}
 	return false;
@@ -336,12 +348,10 @@ bool disk::readDataVerify(const char *const data, uint64_t sector, uint16_t nsec
 	assert(ns <= vnsec);
 	auto d    = vssec - oios;
 	auto ps   = (sector_to_byte(d) + (*io)->pattern_start) % (*io)->pattern.length();
-	auto c    = patternCompare(vbufp, sector_to_byte(ns), (*io)->pattern, ps);
+	auto c    = patternCompare(s, ns, vbufp, sector_to_byte(ns), (*io)->pattern, ps);
 	if (c == true) {
 		/* corruption */
-		cout << "Read IO (" << sector << ", " << nsectors << ") corruption at (" << s << "," << ns << ")" << endl;
 		assert(0);
-		return true;
 	} else if (vnsec <= ns) {
 		/* data has been verified - no corruption */
 		assert(vnsec - ns == 0);
@@ -357,9 +367,19 @@ bool disk::readDataVerify(const char *const data, uint64_t sector, uint16_t nsec
 }
 
 void disk::readDone(const char *const bufp, uint64_t sector, uint16_t nsectors) {
-	auto corruption = readDataVerify(bufp, sector, nsectors);
-	if (corruption) {
-		assert(0);
+	try {
+		auto corruption = readDataVerify(bufp, sector, nsectors);
+		if (corruption) {
+			assert(0);
+		}
+	} catch(Corruption &c) {
+		cout << "Data Corruption\n";
+		cout << "Read(sector = " << c.sector << ", nsectors=" << c.nsectors << ")\n";
+		cout << "Expected Pattern = " << c.pattern << endl;
+		cout << "Read Pattern = " << c.readLine << endl;
+
+		trace_.dumpTraceLog(c.sector, c.nsectors);
+		base.terminateLoopSoon();
 	}
 }
 
