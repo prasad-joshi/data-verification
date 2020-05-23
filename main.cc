@@ -15,7 +15,7 @@ using std::endl;
 DEFINE_string(disk, "/dev/null", "Comma seperated list of block devices for IO verification");
 DEFINE_int32(iodepth, 32, "Number of concurrent IOs");
 DEFINE_int32(percent, 100, "Percent of block device to use for IOs");
-DEFINE_string(blocksize, "4096:40,8192:40",	"Typical block sizes for IO.");
+DEFINE_string(blocksize, "4096:40,8192:40", "Typical block sizes for IO.");
 DEFINE_string(runtime, "1h", "runtime in (s)seconds/(m)minutes/(h)hours/(d)days");
 DEFINE_string(logpath, "/tmp/", "Log directory path");
 
@@ -27,8 +27,8 @@ vector<string> split(const string &str, char delim) {
 	while ((e = str.find(delim, s)) != string::npos) {
 		if (e != s) {
 			tokens.push_back(str.substr(s, e - s));
-			s = e + 1;
 		}
+		s = e + 1;
 	}
 	if (e != s) {
 		tokens.push_back(str.substr(s));

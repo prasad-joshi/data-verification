@@ -61,10 +61,9 @@ uint64_t IO::offset() {
 }
 
 disk::disk(string path, uint16_t percent, vector<pair<uint32_t, uint8_t>> sizes,
-			uint16_t iodepth, uint64_t runtime) :
-				asyncio(iodepth), path_(path), percent_(percent), iodepth_(iodepth),
-				runtime_(runtime), modeSwitched_(false), fd(-1),
-				trace_("/tmp/log.dat") {
+		uint16_t iodepth, uint64_t runtime) : asyncio(iodepth), path_(path),
+		percent_(percent), iodepth_(iodepth), runtime_(runtime),
+		modeSwitched_(false), fd(-1), trace_("/tmp/log.dat"), base(false) {
 	fd = open(path.c_str(), O_RDWR | O_DIRECT);
 	if (fd < 0) {
 		throw runtime_error("Could not open file " + path);
@@ -205,7 +204,7 @@ int disk::readsSubmit(uint64_t nreads) {
 	uint64_t    ns;
 	size_t      sz;
 	uint64_t    o;
-	
+
 	for (auto i = 0; i < nreads; i++) {
 		iogen->next_io(&s, &ns);
 		assert(ns >= 1 && s <= sectors_ && s+ns <= sectors_);
@@ -444,7 +443,7 @@ void disk::writeDone(uint64_t sector, uint16_t nsectors, const string &pattern, 
 		ios.erase(io);
 		if (nios <= oios && nioe >= oioe) {
 			/*
-			 * old is too small - only delete it 
+			 * old is too small - only delete it
 			 *
 			 * For example:
 			 * New IO --> sector 100, nsectors 8
@@ -551,7 +550,7 @@ static void switchIOModeTCB(void *cbdp) {
 void disk::setIOMode(IOMode mode) {
 	this->mode_              = mode;
 	this->ioModeSwitchTimer_ = std::make_unique<TimeoutWrapper>(&base, switchIOModeTCB, this);
-	this->ioModeSwitchTimer_->scheduleTimeout(MIN_TO_MILLI(1));
+	this->ioModeSwitchTimer_->scheduleTimeout(SEC_TO_MILLI(5));
 }
 
 void disk::switchIOMode() {
@@ -616,7 +615,7 @@ void disk::testReadSubmit(uint64_t s, uint16_t ns) {
 	struct iocb cb;
 	size_t      sz;
 	uint64_t    o;
-	
+
 	sz        = sector_to_byte(ns);
 	o         = sector_to_byte(s);
 	auto bufp = getIOBuffer(sz);
@@ -760,7 +759,7 @@ void disk::testNO1() {
 			string p;
 			patternCreate(SECTOR, 1207, p);
 			auto ps = sz % p.length();
-			assert(io->r.sector == SECTOR+ns && io->r.nsectors == 1207-ns && 
+			assert(io->r.sector == SECTOR+ns && io->r.nsectors == 1207-ns &&
 					io->pattern == p && io->pattern_start == ps);
 		}
 		c++;
@@ -782,7 +781,7 @@ void disk::testNO1() {
 			string p;
 			patternCreate(SECTOR, 1207, p);
 			auto ps = sz1 % p.length();
-			assert(io->r.sector == SECTOR+ns1 && io->r.nsectors == 1207-ns1 && 
+			assert(io->r.sector == SECTOR+ns1 && io->r.nsectors == 1207-ns1 &&
 					io->pattern == p && io->pattern_start == ps);
 		}
 		c++;
